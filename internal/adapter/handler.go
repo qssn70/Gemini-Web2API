@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"gemini-web2api/internal/balancer"
+	"gemini-web2api/internal/config"
 	"gemini-web2api/internal/gemini"
+	"gemini-web2api/internal/service"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -25,94 +26,11 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Messages []ChatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
-	Model    string        `json:"model"`
-}
-
-func CORSMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-
-		c.Next()
-	}
-}
-func AuthMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		requiredKey := strings.TrimSpace(os.Getenv("PROXY_API_KEY"))
-
-		if requiredKey == "" {
-			c.Next()
-			return
-		}
-
-		queryKey := strings.TrimSpace(c.Query("key"))
-		headerKey := strings.TrimSpace(c.GetHeader("x-goog-api-key"))
-		authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
-
-		if queryKey != "" && queryKey == requiredKey {
-			c.Next()
-			return
-		}
-		if headerKey != "" && headerKey == requiredKey {
-			c.Next()
-			return
-		}
-
-		if authHeader != "" {
-			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) == 2 && parts[0] == "Bearer" {
-				token := strings.TrimSpace(parts[1])
-				if token == requiredKey {
-					c.Next()
-					return
-				}
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API Key"})
-				return
-			}
-			if queryKey == "" && headerKey == "" {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid Authorization header format"})
-				return
-			}
-		}
-
-		if queryKey == "" && headerKey == "" && authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "API Key is missing"})
-			return
-		}
-
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid API Key"})
-	}
-}
-
-func LoggerMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-
-		accountID, exists := c.Get("account_id")
-		if exists {
-			displayID, ok := accountID.(string)
-			if !ok || displayID == "" {
-				displayID = "default"
-			}
-			log.Printf("[Account '%s'] %s %s - %d - %v",
-				displayID,
-				c.Request.Method,
-				c.Request.URL.Path,
-				c.Writer.Status(),
-				time.Since(start),
-			)
-		}
-	}
+	Messages   []ChatMessage   `json:"messages"`
+	Stream     bool            `json:"stream"`
+	Model      string          `json:"model"`
+	Tools      []service.Tool  `json:"tools,omitempty"`
+	ToolChoice interface{}     `json:"tool_choice,omitempty"`
 }
 
 func ListModelsHandler(c *gin.Context) {
@@ -144,13 +62,14 @@ func isImageModel(model string) bool {
 
 func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		client, accountID := pool.Next()
-		if client == nil {
+		entry, ok := pool.Next()
+		if !ok || entry == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No available accounts"})
 			return
 		}
+		client := entry.Client
 
-		c.Set("account_id", accountID)
+		c.Set("account_id", entry.AccountID)
 
 		var req ChatRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -158,8 +77,12 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			return
 		}
 
-		// Check if this is an image model request
-		if isImageModel(req.Model) {
+		mappedModel := config.MapModel(req.Model)
+		if mappedModel != req.Model {
+			log.Printf("[OpenAI] Model mapped: %s -> %s", req.Model, mappedModel)
+		}
+
+		if isImageModel(mappedModel) {
 			handleImageChatRequest(c, client, req)
 			return
 		}
@@ -167,12 +90,17 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 		var promptBuilder strings.Builder
 		var files []gemini.FileData
 
+		toolPrompt := service.BuildToolPrompt(req.Tools, req.ToolChoice)
+		hasTools := toolPrompt != ""
+
 		for _, msg := range req.Messages {
 			role := "User"
 			if strings.EqualFold(msg.Role, "model") || strings.EqualFold(msg.Role, "assistant") {
 				role = "Model"
 			} else if strings.EqualFold(msg.Role, "system") {
 				role = "System"
+			} else if strings.EqualFold(msg.Role, "tool") {
+				role = "User"
 			}
 
 			promptBuilder.WriteString(fmt.Sprintf("**%s**: ", role))
@@ -214,8 +142,48 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 											}
 										}
 									}
+								} else if strings.HasPrefix(urlStr, "http") {
+									fd, err := client.DownloadAndUpload(urlStr)
+									if err == nil {
+										files = append(files, fd)
+										promptBuilder.WriteString("[Image]")
+									} else {
+										log.Printf("Failed to download image from URL: %v", err)
+										promptBuilder.WriteString(fmt.Sprintf("[Image URL: %s]", urlStr))
+									}
 								} else {
 									promptBuilder.WriteString(fmt.Sprintf("[Image URL: %s]", urlStr))
+								}
+							}
+						}
+					} else if typeStr == "file" {
+						if fileMap, ok := p["file"].(map[string]interface{}); ok {
+							if dataStr, ok := fileMap["data"].(string); ok {
+								mimeType, _ := fileMap["mime_type"].(string)
+								fname, _ := fileMap["filename"].(string)
+								if fname == "" {
+									fname = fmt.Sprintf("file_%d", time.Now().UnixNano())
+									if ext := mimeTypeToFileExt(mimeType); ext != "" {
+										fname += ext
+									}
+								}
+								data, err := base64.StdEncoding.DecodeString(dataStr)
+								if err == nil {
+									fid, err := client.UploadFile(data, fname)
+									if err == nil {
+										files = append(files, gemini.FileData{URL: fid, FileName: fname})
+										promptBuilder.WriteString(fmt.Sprintf("[File: %s]", fname))
+									} else {
+										log.Printf("Failed to upload file: %v", err)
+									}
+								}
+							} else if urlStr, ok := fileMap["url"].(string); ok {
+								fd, err := client.DownloadAndUpload(urlStr)
+								if err == nil {
+									files = append(files, fd)
+									promptBuilder.WriteString(fmt.Sprintf("[File: %s]", fd.FileName))
+								} else {
+									log.Printf("Failed to download file from URL: %v", err)
 								}
 							}
 						}
@@ -225,6 +193,10 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			promptBuilder.WriteString("\n\n")
 		}
 
+		if hasTools {
+			promptBuilder.WriteString("\n" + toolPrompt + "\n")
+		}
+
 		finalPrompt := promptBuilder.String()
 		if finalPrompt == "" {
 			finalPrompt = "Hello"
@@ -232,18 +204,26 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 
 		gemini.RandomDelay()
 
-		respBody, err := client.StreamGenerateContent(finalPrompt, req.Model, files, nil)
+		respBody, err := client.StreamGenerateContent(finalPrompt, mappedModel, files, nil)
 		if err != nil {
 			log.Printf("Gemini request failed: %v", err)
+
+			if gemini.IsAuthError(err) {
+				entry.RecordAuthFailure()
+			} else {
+				entry.RecordFailure()
+			}
+
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to communicate with Gemini: " + err.Error()})
 			return
 		}
 		defer respBody.Close()
 
+		entry.RecordSuccess()
+
 		id := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
 		created := time.Now().Unix()
 
-		// Handle non-streaming request (stream: false)
 		if !req.Stream {
 			var fullText strings.Builder
 			var fullThinking strings.Builder
@@ -253,6 +233,23 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 				fullThinking.WriteString(thought)
 			})
 
+			responseText := fullText.String()
+			message := map[string]interface{}{
+				"role":              "assistant",
+				"content":           responseText,
+				"reasoning_content": fullThinking.String(),
+			}
+
+			finishReason := "stop"
+			if hasTools {
+				toolCalls, cleanText := service.ParseToolCalls(responseText)
+				if len(toolCalls) > 0 {
+					message["content"] = cleanText
+					message["tool_calls"] = toolCalls
+					finishReason = "tool_calls"
+				}
+			}
+
 			resp := map[string]interface{}{
 				"id":      id,
 				"object":  "chat.completion",
@@ -260,13 +257,9 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 				"model":   req.Model,
 				"choices": []map[string]interface{}{
 					{
-						"index": 0,
-						"message": map[string]interface{}{
-							"role":              "assistant",
-							"content":           fullText.String(),
-							"reasoning_content": fullThinking.String(),
-						},
-						"finish_reason": "stop",
+						"index":         0,
+						"message":       message,
+						"finish_reason": finishReason,
 					},
 				},
 			}
@@ -274,26 +267,55 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			return
 		}
 
-		// Handle streaming request (stream: true)
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Transfer-Encoding", "chunked")
 
-		// Send initial Role packet (Required by Cline and others)
 		sendSSERole(c.Writer, id, created, req.Model)
 
-		c.Stream(func(w io.Writer) bool {
-			parseGeminiResponse(respBody, func(text, thought string) {
-				if thought != "" {
-					sendSSEThinking(w, id, created, req.Model, thought)
+		if hasTools {
+			toolFilter := service.NewStreamToolFilter()
+
+			c.Stream(func(w io.Writer) bool {
+				parseGeminiResponse(respBody, func(text, thought string) {
+					if thought != "" {
+						sendSSEThinking(w, id, created, req.Model, thought)
+					}
+					if text != "" {
+						visible, toolCalls := toolFilter.Process(text)
+						if visible != "" {
+							sendSSE(w, id, created, req.Model, visible)
+						}
+						if len(toolCalls) > 0 {
+							sendSSEToolCalls(w, id, created, req.Model, toolCalls)
+						}
+					}
+				})
+
+				remaining, toolCalls := toolFilter.Flush()
+				if remaining != "" {
+					sendSSE(w, id, created, req.Model, remaining)
 				}
-				if text != "" {
-					sendSSE(w, id, created, req.Model, text)
+				if len(toolCalls) > 0 {
+					sendSSEToolCalls(w, id, created, req.Model, toolCalls)
 				}
+
+				return false
 			})
-			return false
-		})
+		} else {
+			c.Stream(func(w io.Writer) bool {
+				parseGeminiResponse(respBody, func(text, thought string) {
+					if thought != "" {
+						sendSSEThinking(w, id, created, req.Model, thought)
+					}
+					if text != "" {
+						sendSSE(w, id, created, req.Model, text)
+					}
+				})
+				return false
+			})
+		}
 
 		w := c.Writer
 		fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -444,10 +466,76 @@ func sendSSEThinking(w io.Writer, id string, created int64, model, thinking stri
 	w.(http.Flusher).Flush()
 }
 
+func sendSSEToolCalls(w io.Writer, id string, created int64, model string, toolCalls []service.ToolCall) {
+	for _, tc := range toolCalls {
+		resp := map[string]interface{}{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{
+							{
+								"index": 0,
+								"id":    tc.ID,
+								"type":  "function",
+								"function": map[string]string{
+									"name":      tc.Function.Name,
+									"arguments": tc.Function.Arguments,
+								},
+							},
+						},
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		bytes, _ := json.Marshal(resp)
+		fmt.Fprintf(w, "data: %s\n\n", bytes)
+		w.(http.Flusher).Flush()
+	}
+}
+
 var imagePlaceholderRegex = regexp.MustCompile(`\s*https?://googleusercontent\.com/image_generation_content/\d+\s*`)
 
 func filterImagePlaceholders(text string) string {
 	return imagePlaceholderRegex.ReplaceAllString(text, "")
+}
+
+func mimeTypeToFileExt(mimeType string) string {
+	switch strings.Split(strings.ToLower(mimeType), ";")[0] {
+	case "application/pdf":
+		return ".pdf"
+	case "text/plain":
+		return ".txt"
+	case "text/csv":
+		return ".csv"
+	case "application/json":
+		return ".json"
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "audio/mpeg":
+		return ".mp3"
+	case "audio/wav":
+		return ".wav"
+	case "video/mp4":
+		return ".mp4"
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return ".docx"
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return ".xlsx"
+	default:
+		return ""
+	}
 }
 
 func parseGeminiResponseFromBytes(content []byte, onChunk func(text, thought string, imgURL string)) {

@@ -19,8 +19,6 @@ const (
 	EndpointGenerate = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 )
 
-// ModelHeaders maps model names to their specific required headers.
-// You can add new models here by inspecting the 'x-goog-ext-525001261-jspb' header in browser DevTools.
 var ModelHeaders = map[string]string{
 	"gemini-2.5-flash":                   `[1,null,null,null,"71c2d248d3b102ff"]`,
 	"gemini-3.1-pro-preview":             `[1,null,null,null,"e6fa609c3fa255c0"]`,
@@ -30,15 +28,21 @@ var ModelHeaders = map[string]string{
 	"gemini-3-pro-image-preview":         `[1,null,null,null,"e051ce1aa80aa576",null,null,0,[4],null,null,2]`,
 }
 
+type GenerateResult struct {
+	Body io.ReadCloser
+	Meta *ChatMetadata
+}
+
 type Client struct {
-	httpClient tls_client.HttpClient
-	Cookies    map[string]string
-	SNlM0e     string
-	VersionBL  string
-	FSID       string
-	ReqID      int
-	AccountID  string
-	ProxyURL   string
+	httpClient    tls_client.HttpClient
+	Cookies       map[string]string
+	SNlM0e        string
+	VersionBL     string
+	FSID          string
+	ReqID         int
+	AccountID     string
+	ProxyURL      string
+	TemporaryChat bool
 }
 
 func NewClient(cookies map[string]string, proxyURL string) (*Client, error) {
@@ -113,7 +117,6 @@ func (c *Client) Init() error {
 		}
 	}
 
-	// 直接匹配 BL 字串格式
 	if c.VersionBL == "" {
 		reBL3 := regexp.MustCompile(`boq_assistant-bard-web-server_[a-zA-Z0-9._]+`)
 		matchBL3 := reBL3.FindString(bodyString)
@@ -166,7 +169,7 @@ func (c *Client) StreamGenerateContent(prompt string, model string, files []File
 			preview = readBodyPreview(resp.Body)
 			resp.Body.Close()
 			log.Printf("账号 '%s' 重新初始化后仍然返回 403。响应预览: %s", c.displayAccountID(), preview)
-			return nil, fmt.Errorf("Account authentication failed (403). Cookie may be expired. Please update cookies in .env")
+			return nil, fmt.Errorf("AUTH_FAILED: Account authentication failed (403). Cookie may be expired")
 		}
 	}
 
@@ -182,7 +185,7 @@ func (c *Client) StreamGenerateContent(prompt string, model string, files []File
 }
 
 func (c *Client) doGenerateContentRequest(prompt string, model string, files []FileData, meta *ChatMetadata) (*http.Response, error) {
-	payload := BuildGeneratePayload(prompt, c.ReqID, files, meta)
+	payload := BuildGeneratePayload(prompt, c.ReqID, files, meta, c.TemporaryChat)
 	c.ReqID++
 
 	form := url.Values{}
@@ -315,4 +318,21 @@ func readBodyPreview(body io.ReadCloser) string {
 	}
 
 	return preview
+}
+
+func IsAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.HasPrefix(err.Error(), "AUTH_FAILED:")
+}
+
+func IsSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "inconsistent with the conversation") ||
+		strings.Contains(msg, "chat not found") ||
+		strings.Contains(msg, "session not found")
 }

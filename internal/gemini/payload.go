@@ -20,21 +20,7 @@ type ChatMetadata struct {
 	RCID string
 }
 
-// BuildGeneratePayload constructs the 'f.req' parameter.
-// Python logic:
-// json.dumps([
-//
-//	None,
-//	json.dumps([
-//	    [prompt, 0, null, image_list, ...],
-//	    None,
-//	    chat_metadata
-//	]),
-//	None,
-//	None
-//
-// ])
-func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *ChatMetadata) string {
+func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *ChatMetadata, temporaryChat bool) string {
 	imagesJSON := `[]`
 	if len(files) > 0 {
 		for i, f := range files {
@@ -62,7 +48,6 @@ func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *Chat
 	inner := `[]`
 	inner, _ = sjson.SetRaw(inner, "0", msgStruct)
 
-	// 語言字段，匹配瀏覽器 f.req 格式
 	langArr := `[]`
 	langArr, _ = sjson.Set(langArr, "0", GetLanguage())
 	inner, _ = sjson.SetRaw(inner, "1", langArr)
@@ -77,14 +62,19 @@ func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *Chat
 		inner, _ = sjson.Set(inner, "2", nil)
 	}
 
-	// Pad to index 7
 	for i := 3; i < 7; i++ {
 		inner, _ = sjson.Set(inner, fmt.Sprintf("%d", i), nil)
 	}
-	// Snapshot Streaming disabled by default (causes issues with incremental updates)
-	// Set SNAPSHOT_STREAMING=1 in .env to enable
+
 	if os.Getenv("SNAPSHOT_STREAMING") == "1" {
 		inner, _ = sjson.Set(inner, "7", 1)
+	}
+
+	if temporaryChat {
+		for i := 8; i < 14; i++ {
+			inner, _ = sjson.Set(inner, fmt.Sprintf("%d", i), nil)
+		}
+		inner, _ = sjson.Set(inner, "14", 1)
 	}
 
 	outer := `[null, "", null, null]`

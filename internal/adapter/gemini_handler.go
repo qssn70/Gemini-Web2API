@@ -95,13 +95,14 @@ func GeminiRouterHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 }
 
 func geminiGenerateContent(c *gin.Context, pool *balancer.AccountPool, model string) {
-	client, accountID := pool.Next()
-	if client == nil {
+	entry, ok := pool.Next()
+	if !ok || entry == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No available accounts"})
 		return
 	}
+	client := entry.Client
 
-	c.Set("account_id", accountID)
+	c.Set("account_id", entry.AccountID)
 
 	var req GeminiGenerateContentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -164,13 +165,14 @@ func geminiGenerateContent(c *gin.Context, pool *balancer.AccountPool, model str
 }
 
 func geminiStreamGenerateContent(c *gin.Context, pool *balancer.AccountPool, model string) {
-	client, accountID := pool.Next()
-	if client == nil {
+	entry, ok := pool.Next()
+	if !ok || entry == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No available accounts"})
 		return
 	}
+	client := entry.Client
 
-	c.Set("account_id", accountID)
+	c.Set("account_id", entry.AccountID)
 
 	var req GeminiGenerateContentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

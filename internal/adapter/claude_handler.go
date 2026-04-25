@@ -19,8 +19,8 @@ import (
 
 func ClaudeMessagesHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		client, accountID := pool.Next()
-		if client == nil {
+		entry, ok := pool.Next()
+		if !ok || entry == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"type": "error",
 				"error": gin.H{
@@ -30,8 +30,9 @@ func ClaudeMessagesHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			})
 			return
 		}
+		client := entry.Client
 
-		c.Set("account_id", accountID)
+		c.Set("account_id", entry.AccountID)
 
 		var req claude.ClaudeRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -256,17 +257,27 @@ func buildClaudePrompt(req *claude.ClaudeRequest, client *gemini.Client) (string
 					builder.WriteString(fmt.Sprintf("<tool_result id=\"%s\">%s</tool_result>",
 						block.ToolUseID, contentStr))
 				case "image":
-					if block.Source != nil && block.Source.Type == "base64" {
-						data, err := base64.StdEncoding.DecodeString(block.Source.Data)
-						if err == nil {
-							fname := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
-							fid, err := client.UploadFile(data, fname)
+					if block.Source != nil {
+						if block.Source.Type == "base64" {
+							data, err := base64.StdEncoding.DecodeString(block.Source.Data)
 							if err == nil {
-								files = append(files, gemini.FileData{
-									URL:      fid,
-									FileName: fname,
-								})
+								fname := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
+								fid, err := client.UploadFile(data, fname)
+								if err == nil {
+									files = append(files, gemini.FileData{
+										URL:      fid,
+										FileName: fname,
+									})
+									builder.WriteString("[Image]")
+								}
+							}
+						} else if block.Source.Type == "url" {
+							fd, err := client.DownloadAndUpload(block.Source.Data)
+							if err == nil {
+								files = append(files, fd)
 								builder.WriteString("[Image]")
+							} else {
+								log.Printf("[Claude] Failed to download image from URL: %v", err)
 							}
 						}
 					}

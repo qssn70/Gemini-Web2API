@@ -50,13 +50,14 @@ func sizeToAspectRatio(size string) string {
 
 func ImageGenerationHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		client, accountID := pool.Next()
-		if client == nil {
+		entry, ok := pool.Next()
+		if !ok || entry == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No available accounts"})
 			return
 		}
+		client := entry.Client
 
-		c.Set("account_id", accountID)
+		c.Set("account_id", entry.AccountID)
 
 		var req ImageGenerationRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
