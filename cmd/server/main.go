@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -19,7 +20,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
 )
 
 var (
@@ -37,16 +37,40 @@ func main() {
 		return
 	}
 
-	_ = godotenv.Load()
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("Failed to get working directory: %v", err)
+	}
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("Failed to get executable path: %v", err)
+	}
+	log.Printf("[Startup] Working directory: %s", cwd)
+	log.Printf("[Startup] Executable path: %s", execPath)
+
+	loadedEnvPath, err := loadEnvFile()
+	if err != nil {
+		log.Fatalf("[Startup] Failed to load .env: %v", err)
+	}
+	if loadedEnvPath != "" {
+		log.Printf("[Startup] Loaded .env from: %s", loadedEnvPath)
+	} else {
+		log.Printf("[Startup] No .env found in working directory or executable directory")
+	}
 
 	cfg := config.LoadConfig()
-
 	config.LoadModelMapping()
+
+	authEnabled, authSource := authStatus()
+	if authEnabled {
+		log.Printf("[Startup] Auth enabled (source: %s)", authSource)
+	} else {
+		log.Printf("[Startup] Auth disabled (no PROXY_API_KEY loaded from .env or environment)")
+	}
 
 	pool = balancer.NewAccountPool()
 	accountConfigs = make(map[string]string)
 
-	var err error
 	store, err = storage.NewStore(cfg.Storage.Path)
 	if err != nil {
 		log.Printf("[Storage] Failed to open database: %v (session reuse disabled)", err)
@@ -56,7 +80,7 @@ func main() {
 	}
 
 	go loadAccountsAsync()
-	go watchEnvFile()
+	go watchEnvFile(filepath.Dir(execPath))
 
 	r := gin.Default()
 
@@ -65,30 +89,25 @@ func main() {
 	r.Use(adapter.AuthMiddleware())
 	r.Use(adapter.LoggerMiddleware())
 
-	// OpenAI Protocol
 	r.POST("/v1/chat/completions", adapter.ChatCompletionHandler(pool))
 	r.POST("/v1/images/generations", adapter.ImageGenerationHandler(pool))
 	r.GET("/v1/models", adapter.ListModelsHandler)
-
-	// OpenAI Responses API
 	r.POST("/v1/responses", adapter.ResponsesHandler(pool))
-
-	// Claude Protocol
 	r.POST("/v1/messages", adapter.ClaudeMessagesHandler(pool))
 	r.POST("/v1/messages/count_tokens", adapter.ClaudeCountTokensHandler(pool))
 	r.GET("/v1/models/claude", adapter.ClaudeListModelsHandler)
-
-	// Gemini Native Protocol
 	r.POST("/v1beta/models/*action", adapter.GeminiRouterHandler(pool))
 	r.GET("/v1beta/models", adapter.GeminiListModelsHandler)
 
 	r.GET("/", func(c *gin.Context) {
+		authEnabled, _ := authStatus()
 		status := gin.H{
 			"status":    "Gemini-Web2API (Go) is running",
 			"docs":      "POST /v1/chat/completions (OpenAI) | POST /v1/messages (Claude) | POST /v1beta/models/{model}:generateContent (Gemini) | POST /v1/responses (Responses)",
 			"protocols": []string{"openai", "claude", "gemini", "responses"},
 			"accounts":  pool.Size(),
 			"healthy":   pool.HealthyCount(),
+			"auth":      authEnabled,
 		}
 		if store != nil {
 			if count, err := store.Stats(); err == nil {
@@ -271,7 +290,7 @@ func loadAccountsAsync() {
 	log.Printf("Total %d account(s) available for load balancing (%d healthy)", pool.Size(), pool.HealthyCount())
 }
 
-func watchEnvFile() {
+func watchEnvFile(execDir string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Printf("Failed to create file watcher: %v", err)
@@ -279,13 +298,25 @@ func watchEnvFile() {
 	}
 	defer watcher.Close()
 
-	err = watcher.Add(".env")
+	cwd, err := os.Getwd()
 	if err != nil {
-		log.Printf("Failed to watch .env file: %v", err)
+		log.Printf("Failed to get working directory for watcher: %v", err)
 		return
 	}
 
-	log.Println("Watching .env for changes...")
+	candidates := envCandidates(cwd, execDir)
+	watched := false
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			if err := watcher.Add(candidate); err == nil {
+				log.Printf("Watching %s for changes...", candidate)
+				watched = true
+			}
+		}
+	}
+	if !watched {
+		log.Printf("No .env file available to watch in working directory or executable directory")
+	}
 
 	for {
 		select {
@@ -293,10 +324,17 @@ func watchEnvFile() {
 			if !ok {
 				return
 			}
-			if event.Op&fsnotify.Write == fsnotify.Write {
-				log.Println(".env changed, reloading accounts...")
+			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+				log.Printf("%s changed, reloading environment...", event.Name)
 				time.Sleep(200 * time.Millisecond)
-				_ = godotenv.Load()
+				loadedPath, err := loadEnvFile()
+				if err != nil {
+					log.Printf("[Startup] Failed to reload .env: %v", err)
+					continue
+				}
+				if loadedPath != "" {
+					log.Printf("[Startup] Reloaded .env from: %s", loadedPath)
+				}
 				config.LoadConfig()
 				config.LoadModelMapping()
 				loadAccountsAsync()

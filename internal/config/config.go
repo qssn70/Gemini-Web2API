@@ -6,46 +6,44 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"gopkg.in/yaml.v3"
 )
 
 type ServerConfig struct {
-	Port   string `yaml:"port"`
-	APIKey string `yaml:"api_key"`
+	Port   string
+	APIKey string
 }
 
 type GeminiConfig struct {
-	Timeout             int    `yaml:"timeout"`
-	ChatMode            string `yaml:"chat_mode"`
-	MaxChars            int    `yaml:"max_chars"`
-	OversizedStrategy   string `yaml:"oversized_strategy"`
-	SessionTTLMinutes   int    `yaml:"session_ttl_minutes"`
-	WatchdogTimeout     int    `yaml:"watchdog_timeout"`
-	SnapshotStreaming    bool   `yaml:"snapshot_streaming"`
-	Language             string `yaml:"language"`
+	Timeout           int
+	ChatMode          string
+	MaxChars          int
+	OversizedStrategy string
+	SessionTTLMinutes int
+	WatchdogTimeout   int
+	SnapshotStreaming bool
+	Language          string
 }
 
 type StorageConfig struct {
-	Path                 string `yaml:"path"`
-	MaxSizeMB            int    `yaml:"max_size_mb"`
-	RetentionDays        int    `yaml:"retention_days"`
-	CleanupIntervalHours int    `yaml:"cleanup_interval_hours"`
+	Path                 string
+	MaxSizeMB            int
+	RetentionDays        int
+	CleanupIntervalHours int
 }
 
 type AccountConfig struct {
-	ID     string `yaml:"id"`
-	PSID   string `yaml:"psid"`
-	PSIDTS string `yaml:"psidts"`
-	Proxy  string `yaml:"proxy"`
+	ID     string
+	PSID   string
+	PSIDTS string
+	Proxy  string
 }
 
 type AppConfig struct {
-	Server       ServerConfig      `yaml:"server"`
-	Gemini       GeminiConfig      `yaml:"gemini"`
-	Storage      StorageConfig     `yaml:"storage"`
-	Accounts     []AccountConfig   `yaml:"accounts"`
-	ModelMapping map[string]string `yaml:"model_mapping"`
+	Server       ServerConfig
+	Gemini       GeminiConfig
+	Storage      StorageConfig
+	Accounts     []AccountConfig
+	ModelMapping map[string]string
 }
 
 var (
@@ -79,15 +77,7 @@ func DefaultConfig() *AppConfig {
 
 func LoadConfig() *AppConfig {
 	cfg := DefaultConfig()
-
-	data, err := os.ReadFile("config.yaml")
-	if err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			log.Printf("[Config] Failed to parse config.yaml: %v, using defaults", err)
-		} else {
-			log.Println("[Config] Loaded config.yaml")
-		}
-	}
+	log.Println("[Config] Loaded configuration from environment variables and defaults")
 
 	applyEnvOverrides(cfg)
 
@@ -139,6 +129,11 @@ func applyEnvOverrides(cfg *AppConfig) {
 			cfg.Gemini.SessionTTLMinutes = n
 		}
 	}
+	if v := os.Getenv("WATCHDOG_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Gemini.WatchdogTimeout = n
+		}
+	}
 	if v := os.Getenv("LANGUAGE"); v != "" {
 		cfg.Gemini.Language = v
 	}
@@ -157,6 +152,11 @@ func applyEnvOverrides(cfg *AppConfig) {
 	if v := os.Getenv("RETENTION_DAYS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Storage.RetentionDays = n
+		}
+	}
+	if v := os.Getenv("CLEANUP_INTERVAL_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Storage.CleanupIntervalHours = n
 		}
 	}
 

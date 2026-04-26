@@ -350,53 +350,87 @@ func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) {
 			}
 
 			inner := gjson.Parse(dataStr)
-
 			candidates := inner.Get("4")
-			if candidates.IsArray() {
-				candidates.ForEach(func(_, candidate gjson.Result) bool {
-					rawText := candidate.Get("1.0").String()
-					rawThoughts := candidate.Get("37.0.0").String()
-
-					deltaText := ""
-					deltaThoughts := ""
-
-					rawRunes := []rune(rawText)
-					lastRunes := []rune(lastText)
-					if len(rawRunes) > len(lastRunes) {
-						deltaText = string(rawRunes[len(lastRunes):])
-						lastText = rawText
-					} else if len(lastRunes) == 0 && len(rawRunes) > 0 {
-						deltaText = rawText
-						lastText = rawText
-					}
-
-					rawThoughtRunes := []rune(rawThoughts)
-					lastThoughtRunes := []rune(lastThoughts)
-					if len(rawThoughtRunes) > len(lastThoughtRunes) {
-						deltaThoughts = string(rawThoughtRunes[len(lastThoughtRunes):])
-						lastThoughts = rawThoughts
-					} else if len(lastThoughtRunes) == 0 && len(rawThoughtRunes) > 0 {
-						deltaThoughts = rawThoughts
-						lastThoughts = rawThoughts
-					}
-
-					if deltaText == "" && deltaThoughts == "" {
-						return true
-					}
-
-					deltaText = strings.ReplaceAll(deltaText, `\<`, `<`)
-					deltaText = strings.ReplaceAll(deltaText, `\>`, `>`)
-					deltaText = strings.ReplaceAll(deltaText, `\_`, `_`)
-					deltaText = strings.ReplaceAll(deltaText, `\[`, `[`)
-					deltaText = strings.ReplaceAll(deltaText, `\]`, `]`)
-					deltaText = filterImagePlaceholders(deltaText)
-
-					if deltaText != "" || deltaThoughts != "" {
-						onChunk(deltaText, deltaThoughts)
-					}
-					return true
-				})
+			if !candidates.IsArray() {
+				return true
 			}
+
+			candidates.ForEach(func(_, candidate gjson.Result) bool {
+				rawText := ""
+				rawThoughts := ""
+
+				parts := candidate.Get("1.1")
+				if parts.IsArray() {
+					parts.ForEach(func(_, part gjson.Result) bool {
+						if !part.IsArray() {
+							return true
+						}
+
+						text := part.Get("0").String()
+						if text == "" {
+							return true
+						}
+
+						isThought := false
+						if part.Get("2").Exists() {
+							isThought = part.Get("2").Bool()
+						}
+
+						if isThought {
+							rawThoughts += text
+						} else {
+							rawText += text
+						}
+						return true
+					})
+				}
+
+				if rawText == "" {
+					rawText = candidate.Get("1.0").String()
+				}
+				if rawThoughts == "" {
+					rawThoughts = candidate.Get("37.0.0").String()
+				}
+
+				deltaText := ""
+				deltaThoughts := ""
+
+				rawRunes := []rune(rawText)
+				lastRunes := []rune(lastText)
+				if len(rawRunes) > len(lastRunes) {
+					deltaText = string(rawRunes[len(lastRunes):])
+					lastText = rawText
+				} else if len(lastRunes) == 0 && len(rawRunes) > 0 {
+					deltaText = rawText
+					lastText = rawText
+				}
+
+				rawThoughtRunes := []rune(rawThoughts)
+				lastThoughtRunes := []rune(lastThoughts)
+				if len(rawThoughtRunes) > len(lastThoughtRunes) {
+					deltaThoughts = string(rawThoughtRunes[len(lastThoughtRunes):])
+					lastThoughts = rawThoughts
+				} else if len(lastThoughtRunes) == 0 && len(rawThoughtRunes) > 0 {
+					deltaThoughts = rawThoughts
+					lastThoughts = rawThoughts
+				}
+
+				if deltaText == "" && deltaThoughts == "" {
+					return true
+				}
+
+				deltaText = strings.ReplaceAll(deltaText, `\<`, `<`)
+				deltaText = strings.ReplaceAll(deltaText, `\>`, `>`)
+				deltaText = strings.ReplaceAll(deltaText, `\_`, `_`)
+				deltaText = strings.ReplaceAll(deltaText, `\[`, `[`)
+				deltaText = strings.ReplaceAll(deltaText, `\]`, `]`)
+				deltaText = filterImagePlaceholders(deltaText)
+
+				if deltaText != "" || deltaThoughts != "" {
+					onChunk(deltaText, deltaThoughts)
+				}
+				return true
+			})
 			return true
 		})
 	}

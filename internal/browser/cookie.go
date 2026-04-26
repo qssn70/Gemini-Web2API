@@ -208,7 +208,47 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 }
 
 func createEnvTemplate() {
-	template := "__Secure-1PSID=\n__Secure-1PSIDTS=\nACCOUNTS=\nPROXY=\nPROXY_API_KEY=\nPORT=8007\n"
+	template := `# ==============================================
+# Gemini Web Cookies
+# ==============================================
+__Secure-1PSID=
+__Secure-1PSIDTS=
+
+# Additional accounts
+# __Secure-1PSID_main=
+# __Secure-1PSIDTS_main=
+
+# Load balancing
+ACCOUNTS=
+
+# Proxy
+PROXY=
+# PROXY_main=
+
+# API security
+PROXY_API_KEY=
+
+# Server
+PORT=8007
+
+# Language
+LANGUAGE=en
+
+# Runtime behavior
+CHAT_MODE=normal
+MAX_CHARS=1000000
+OVERSIZED_STRATEGY=compact
+SESSION_TTL_MINUTES=15
+SNAPSHOT_STREAMING=0
+
+# Storage
+STORAGE_PATH=./data/sessions.db
+STORAGE_MAX_SIZE_MB=256
+RETENTION_DAYS=14
+
+# Model mapping
+MODEL_MAPPING=
+`
 	err := os.WriteFile(".env", []byte(template), 0644)
 	if err != nil {
 		fmt.Printf("Warning: Failed to create .env template: %v\n", err)
