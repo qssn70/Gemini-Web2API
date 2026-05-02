@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -26,11 +25,11 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Messages   []ChatMessage   `json:"messages"`
-	Stream     bool            `json:"stream"`
-	Model      string          `json:"model"`
-	Tools      []service.Tool  `json:"tools,omitempty"`
-	ToolChoice interface{}     `json:"tool_choice,omitempty"`
+	Messages   []ChatMessage  `json:"messages"`
+	Stream     bool           `json:"stream"`
+	Model      string         `json:"model"`
+	Tools      []service.Tool `json:"tools,omitempty"`
+	ToolChoice interface{}    `json:"tool_choice,omitempty"`
 }
 
 func ListModelsHandler(c *gin.Context) {
@@ -228,10 +227,18 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			var fullText strings.Builder
 			var fullThinking strings.Builder
 
-			parseGeminiResponse(respBody, func(text, thought string) {
+			parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 				fullText.WriteString(text)
 				fullThinking.WriteString(thought)
 			})
+			if err := geminiParseError(parseStatus, parseErr); err != nil {
+				log.Printf("[OpenAI] Failed to parse Gemini response: %v", err)
+				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+					"message": err.Error(),
+					"type":    "upstream_parse_error",
+				}})
+				return
+			}
 
 			responseText := fullText.String()
 			message := map[string]interface{}{
@@ -278,7 +285,7 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			toolFilter := service.NewStreamToolFilter()
 
 			c.Stream(func(w io.Writer) bool {
-				parseGeminiResponse(respBody, func(text, thought string) {
+				parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 					if thought != "" {
 						sendSSEThinking(w, id, created, req.Model, thought)
 					}
@@ -292,6 +299,10 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 						}
 					}
 				})
+				if err := geminiParseError(parseStatus, parseErr); err != nil {
+					log.Printf("[OpenAI] Failed to parse Gemini stream: %v", err)
+					writeOpenAIStreamError(w, id, created, req.Model, err)
+				}
 
 				remaining, toolCalls := toolFilter.Flush()
 				if remaining != "" {
@@ -305,7 +316,7 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			})
 		} else {
 			c.Stream(func(w io.Writer) bool {
-				parseGeminiResponse(respBody, func(text, thought string) {
+				parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 					if thought != "" {
 						sendSSEThinking(w, id, created, req.Model, thought)
 					}
@@ -313,6 +324,10 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 						sendSSE(w, id, created, req.Model, text)
 					}
 				})
+				if err := geminiParseError(parseStatus, parseErr); err != nil {
+					log.Printf("[OpenAI] Failed to parse Gemini stream: %v", err)
+					writeOpenAIStreamError(w, id, created, req.Model, err)
+				}
 				return false
 			})
 		}
@@ -323,117 +338,414 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 	}
 }
 
+type geminiParseStatus struct {
+	Recognized   bool
+	Emitted      bool
+	FrameCount   int
+	PartCount    int
+	PayloadCount int
+	CandidateSet int
+	MatchedNodes int
+}
+
+func geminiParseError(status geminiParseStatus, err error) error {
+	if err != nil {
+		return fmt.Errorf("failed to read Gemini response stream: %w", err)
+	}
+	if !status.Recognized {
+		return fmt.Errorf("malformed Gemini response: no supported output structure found (frames=%d parts=%d payloads=%d candidate_sets=%d matched_nodes=%d)", status.FrameCount, status.PartCount, status.PayloadCount, status.CandidateSet, status.MatchedNodes)
+	}
+	return nil
+}
+
 // Extract common parsing logic
-func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) {
-	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, 0, 1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
-
+func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) (geminiParseStatus, error) {
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return geminiParseStatus{}, err
+	}
+	parts := extractGeminiResponseParts(string(body))
 	var lastText, lastThoughts string
+	status := geminiParseStatus{FrameCount: len(extractGeminiResponseFrames(string(body))), PartCount: len(parts)}
 
-	for scanner.Scan() {
-		line := strings.TrimPrefix(scanner.Text(), ")]}'")
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		outer := gjson.Parse(line)
-		if !outer.IsArray() {
-			continue
-		}
-
-		outer.ForEach(func(key, value gjson.Result) bool {
-			dataStr := value.Get("2").String()
-			if dataStr == "" {
-				return true
-			}
-
+	for _, part := range parts {
+		payloads := extractGeminiPayloadStrings(part)
+		status.PayloadCount += len(payloads)
+		for _, dataStr := range payloads {
 			inner := gjson.Parse(dataStr)
-			candidates := inner.Get("4")
-			if !candidates.IsArray() {
+			candidateSets := extractGeminiCandidateSets(inner)
+			status.CandidateSet += len(candidateSets)
+			status.MatchedNodes += countGeminiCandidateLikeNodes(inner)
+
+			for _, candidates := range candidateSets {
+				candidates.ForEach(func(_, candidate gjson.Result) bool {
+					rawText := ""
+					rawThoughts := ""
+
+					parts := candidate.Get("1.1")
+					if parts.IsArray() {
+						status.Recognized = true
+						parts.ForEach(func(_, part gjson.Result) bool {
+							if !part.IsArray() {
+								return true
+							}
+
+							textValue := part.Get("0")
+							if textValue.Type != gjson.String {
+								return true
+							}
+							text := textValue.String()
+							if text == "" {
+								return true
+							}
+
+							isThought := false
+							if part.Get("2").Exists() {
+								isThought = part.Get("2").Bool()
+							}
+
+							if isThought {
+								rawThoughts += text
+							} else {
+								rawText += text
+							}
+							return true
+						})
+					}
+
+					if rawText == "" {
+						fallbackText := candidate.Get("1.0")
+						if fallbackText.Type == gjson.String {
+							status.Recognized = true
+							rawText = fallbackText.String()
+						}
+					}
+					if rawText == "" {
+						cardText := candidate.Get("22.0")
+						if cardText.Type == gjson.String {
+							status.Recognized = true
+							rawText = cardText.String()
+						}
+					}
+					if rawThoughts == "" {
+						fallbackThoughts := candidate.Get("37.0.0")
+						if fallbackThoughts.Type == gjson.String {
+							status.Recognized = true
+							rawThoughts = fallbackThoughts.String()
+						}
+					}
+
+					deltaText := ""
+					deltaThoughts := ""
+
+					rawRunes := []rune(rawText)
+					lastRunes := []rune(lastText)
+					if len(rawRunes) > len(lastRunes) {
+						deltaText = string(rawRunes[len(lastRunes):])
+						lastText = rawText
+					} else if len(lastRunes) == 0 && len(rawRunes) > 0 {
+						deltaText = rawText
+						lastText = rawText
+					}
+
+					rawThoughtRunes := []rune(rawThoughts)
+					lastThoughtRunes := []rune(lastThoughts)
+					if len(rawThoughtRunes) > len(lastThoughtRunes) {
+						deltaThoughts = string(rawThoughtRunes[len(lastThoughtRunes):])
+						lastThoughts = rawThoughts
+					} else if len(lastThoughtRunes) == 0 && len(rawThoughtRunes) > 0 {
+						deltaThoughts = rawThoughts
+						lastThoughts = rawThoughts
+					}
+
+					if deltaText == "" && deltaThoughts == "" {
+						return true
+					}
+
+					deltaText = strings.ReplaceAll(deltaText, `\<`, `<`)
+					deltaText = strings.ReplaceAll(deltaText, `\>`, `>`)
+					deltaText = strings.ReplaceAll(deltaText, `\_`, `_`)
+					deltaText = strings.ReplaceAll(deltaText, `\[`, `[`)
+					deltaText = strings.ReplaceAll(deltaText, `\]`, `]`)
+					deltaText = filterImagePlaceholders(deltaText)
+
+					if deltaText != "" || deltaThoughts != "" {
+						status.Emitted = true
+						onChunk(deltaText, deltaThoughts)
+					}
+					return true
+				})
+			}
+		}
+	}
+
+	return status, nil
+}
+
+func extractGeminiCandidateSets(payload gjson.Result) []gjson.Result {
+	var sets []gjson.Result
+	seen := map[string]struct{}{}
+	addSet := func(candidateSet gjson.Result, requireCandidateLike bool) {
+		if !candidateSet.IsArray() {
+			return
+		}
+		if requireCandidateLike && !isGeminiCandidateSet(candidateSet) {
+			return
+		}
+		key := candidateSet.Raw
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			sets = append(sets, candidateSet)
+		}
+	}
+	var add func(gjson.Result)
+	add = func(value gjson.Result) {
+		if !value.Exists() {
+			return
+		}
+		for _, path := range []string{"4", "0.4", "1.4", "response.candidates", "candidates"} {
+			addSet(value.Get(path), false)
+		}
+
+		for _, path := range []string{"0", "1", "2"} {
+			nested := value.Get(path)
+			if nested.Type != gjson.String {
+				continue
+			}
+			raw := strings.TrimSpace(nested.String())
+			if strings.HasPrefix(raw, "[") || strings.HasPrefix(raw, "{") {
+				add(gjson.Parse(raw))
+			}
+		}
+	}
+	add(payload)
+
+	visited := 0
+	var walk func(gjson.Result, int)
+	walk = func(value gjson.Result, depth int) {
+		if depth > 6 || visited > 500 || !value.Exists() {
+			return
+		}
+		visited++
+		addSet(value, true)
+		if value.IsArray() || value.IsObject() {
+			value.ForEach(func(_, child gjson.Result) bool {
+				walk(child, depth+1)
+				return visited <= 500
+			})
+		}
+	}
+	walk(payload, 0)
+
+	return sets
+}
+
+func isGeminiCandidateSet(value gjson.Result) bool {
+	if !value.IsArray() {
+		return false
+	}
+	found := false
+	value.ForEach(func(_, candidate gjson.Result) bool {
+		if isGeminiCandidateLike(candidate) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func isGeminiCandidateLike(candidate gjson.Result) bool {
+	if !candidate.Exists() || (!candidate.IsArray() && !candidate.IsObject()) {
+		return false
+	}
+	for _, path := range []string{"1.0", "22.0", "37.0.0"} {
+		if candidate.Get(path).Type == gjson.String {
+			return true
+		}
+	}
+	for _, path := range []string{"1.1", "content.parts", "parts"} {
+		if containsStringPart(candidate.Get(path)) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsStringPart(value gjson.Result) bool {
+	if value.Type == gjson.String {
+		return true
+	}
+	if !value.IsArray() {
+		return false
+	}
+	found := false
+	value.ForEach(func(_, part gjson.Result) bool {
+		if part.Type == gjson.String || part.Get("0").Type == gjson.String || part.Get("text").Type == gjson.String {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func countGeminiCandidateLikeNodes(payload gjson.Result) int {
+	count := 0
+	visited := 0
+	var walk func(gjson.Result, int)
+	walk = func(value gjson.Result, depth int) {
+		if depth > 6 || visited > 500 || !value.Exists() {
+			return
+		}
+		visited++
+		if isGeminiCandidateLike(value) {
+			count++
+		}
+		if value.IsArray() || value.IsObject() {
+			value.ForEach(func(_, child gjson.Result) bool {
+				walk(child, depth+1)
+				return visited <= 500
+			})
+		}
+	}
+	walk(payload, 0)
+	return count
+}
+
+func extractGeminiPayloadStrings(part gjson.Result) []string {
+	var payloads []string
+	for _, path := range []string{"2", "1", "0"} {
+		value := part.Get(path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		payload := strings.TrimSpace(value.String())
+		if strings.HasPrefix(payload, "[") || strings.HasPrefix(payload, "{") {
+			payloads = append(payloads, payload)
+		}
+	}
+
+	if part.IsArray() {
+		part.ForEach(func(_, value gjson.Result) bool {
+			if value.Type != gjson.String {
 				return true
 			}
-
-			candidates.ForEach(func(_, candidate gjson.Result) bool {
-				rawText := ""
-				rawThoughts := ""
-
-				parts := candidate.Get("1.1")
-				if parts.IsArray() {
-					parts.ForEach(func(_, part gjson.Result) bool {
-						if !part.IsArray() {
-							return true
-						}
-
-						text := part.Get("0").String()
-						if text == "" {
-							return true
-						}
-
-						isThought := false
-						if part.Get("2").Exists() {
-							isThought = part.Get("2").Bool()
-						}
-
-						if isThought {
-							rawThoughts += text
-						} else {
-							rawText += text
-						}
-						return true
-					})
-				}
-
-				if rawText == "" {
-					rawText = candidate.Get("1.0").String()
-				}
-				if rawThoughts == "" {
-					rawThoughts = candidate.Get("37.0.0").String()
-				}
-
-				deltaText := ""
-				deltaThoughts := ""
-
-				rawRunes := []rune(rawText)
-				lastRunes := []rune(lastText)
-				if len(rawRunes) > len(lastRunes) {
-					deltaText = string(rawRunes[len(lastRunes):])
-					lastText = rawText
-				} else if len(lastRunes) == 0 && len(rawRunes) > 0 {
-					deltaText = rawText
-					lastText = rawText
-				}
-
-				rawThoughtRunes := []rune(rawThoughts)
-				lastThoughtRunes := []rune(lastThoughts)
-				if len(rawThoughtRunes) > len(lastThoughtRunes) {
-					deltaThoughts = string(rawThoughtRunes[len(lastThoughtRunes):])
-					lastThoughts = rawThoughts
-				} else if len(lastThoughtRunes) == 0 && len(rawThoughtRunes) > 0 {
-					deltaThoughts = rawThoughts
-					lastThoughts = rawThoughts
-				}
-
-				if deltaText == "" && deltaThoughts == "" {
-					return true
-				}
-
-				deltaText = strings.ReplaceAll(deltaText, `\<`, `<`)
-				deltaText = strings.ReplaceAll(deltaText, `\>`, `>`)
-				deltaText = strings.ReplaceAll(deltaText, `\_`, `_`)
-				deltaText = strings.ReplaceAll(deltaText, `\[`, `[`)
-				deltaText = strings.ReplaceAll(deltaText, `\]`, `]`)
-				deltaText = filterImagePlaceholders(deltaText)
-
-				if deltaText != "" || deltaThoughts != "" {
-					onChunk(deltaText, deltaThoughts)
-				}
-				return true
-			})
+			payload := strings.TrimSpace(value.String())
+			if strings.HasPrefix(payload, "[") || strings.HasPrefix(payload, "{") {
+				payloads = append(payloads, payload)
+			}
 			return true
 		})
 	}
+
+	if strings.HasPrefix(strings.TrimSpace(part.Raw), "[") || strings.HasPrefix(strings.TrimSpace(part.Raw), "{") {
+		payloads = append(payloads, part.Raw)
+	}
+
+	return payloads
+}
+
+func extractGeminiResponseParts(body string) []gjson.Result {
+	frames := extractGeminiResponseFrames(body)
+	var parts []gjson.Result
+	for _, frame := range frames {
+		parsed := gjson.Parse(frame)
+		if parsed.IsArray() {
+			if isGeminiRPCRow(parsed) {
+				parts = append(parts, parsed)
+				continue
+			}
+			parsed.ForEach(func(_, value gjson.Result) bool {
+				parts = append(parts, value)
+				return true
+			})
+			continue
+		}
+		if parsed.Exists() {
+			parts = append(parts, parsed)
+		}
+	}
+	return parts
+}
+
+func isGeminiRPCRow(value gjson.Result) bool {
+	if !value.IsArray() {
+		return false
+	}
+	first := value.Get("0")
+	if !first.Exists() || first.Type != gjson.String {
+		return false
+	}
+	tag := first.String()
+	return tag == "wrb.fr" || strings.HasPrefix(tag, "wrb.")
+}
+
+func extractGeminiResponseFrames(body string) []string {
+	body = strings.TrimPrefix(body, ")]}'")
+	var frames []string
+	remaining := strings.TrimSpace(body)
+
+	for remaining != "" {
+		remaining = strings.TrimLeft(remaining, "\r\n\t ")
+		if remaining == "" {
+			break
+		}
+
+		idx := 0
+		for idx < len(remaining) && remaining[idx] >= '0' && remaining[idx] <= '9' {
+			idx++
+		}
+		if idx > 0 {
+			frameLen := 0
+			for _, r := range remaining[:idx] {
+				frameLen = frameLen*10 + int(r-'0')
+			}
+			rest := strings.TrimLeft(remaining[idx:], "\r\n")
+			if frameLen > 0 && len(rest) >= frameLen {
+				frame := strings.TrimSpace(rest[:frameLen])
+				if strings.HasPrefix(frame, "[") || strings.HasPrefix(frame, "{") {
+					frames = append(frames, frame)
+				}
+				remaining = rest[frameLen:]
+				continue
+			}
+		}
+
+		lineEnd := strings.IndexAny(remaining, "\r\n")
+		if lineEnd < 0 {
+			line := strings.TrimSpace(remaining)
+			if strings.HasPrefix(line, "[") || strings.HasPrefix(line, "{") {
+				frames = append(frames, line)
+			}
+			break
+		}
+
+		line := strings.TrimSpace(remaining[:lineEnd])
+		if strings.HasPrefix(line, "[") || strings.HasPrefix(line, "{") {
+			frames = append(frames, line)
+		}
+		remaining = remaining[lineEnd+1:]
+	}
+
+	return frames
+}
+
+func writeOpenAIStreamError(w io.Writer, id string, created int64, model string, err error) {
+	resp := map[string]interface{}{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"error": map[string]string{
+			"message": err.Error(),
+			"type":    "upstream_parse_error",
+		},
+		"choices": []map[string]interface{}{},
+	}
+	bytes, _ := json.Marshal(resp)
+	fmt.Fprintf(w, "data: %s\n\n", bytes)
+	w.(http.Flusher).Flush()
 }
 
 func sendSSERole(w io.Writer, id string, created int64, model string) {

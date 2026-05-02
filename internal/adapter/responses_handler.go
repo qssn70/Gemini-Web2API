@@ -182,10 +182,18 @@ func handleResponsesNonStream(c *gin.Context, respBody io.ReadCloser, responseID
 	var fullText strings.Builder
 	var fullThinking strings.Builder
 
-	parseGeminiResponse(respBody, func(text, thought string) {
+	parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 		fullText.WriteString(text)
 		fullThinking.WriteString(thought)
 	})
+	if err := geminiParseError(parseStatus, parseErr); err != nil {
+		log.Printf("[Responses] Failed to parse Gemini response: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": err.Error(),
+			"type":    "upstream_parse_error",
+		}})
+		return
+	}
 
 	output := []gin.H{}
 
@@ -215,13 +223,13 @@ func handleResponsesNonStream(c *gin.Context, respBody io.ReadCloser, responseID
 	})
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":          responseID,
-		"object":      "response",
-		"created_at":  created,
-		"model":       model,
-		"output":      output,
-		"status":      "completed",
-		"usage":       gin.H{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+		"id":         responseID,
+		"object":     "response",
+		"created_at": created,
+		"model":      model,
+		"output":     output,
+		"status":     "completed",
+		"usage":      gin.H{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
 	})
 }
 
@@ -278,7 +286,7 @@ func handleResponsesStream(c *gin.Context, respBody io.ReadCloser, responseID st
 	thinkingStarted := false
 
 	c.Stream(func(cw io.Writer) bool {
-		parseGeminiResponse(respBody, func(text, thought string) {
+		parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 			if thought != "" {
 				if !thinkingStarted {
 					thinkingStarted = true
@@ -292,27 +300,44 @@ func handleResponsesStream(c *gin.Context, respBody io.ReadCloser, responseID st
 					})
 				}
 				writeEvent("response.reasoning_summary_text.delta", gin.H{
-					"output_index":  0,
-					"summary_index": 0,
-					"delta":         thought,
+					"output_index":    0,
+					"summary_index":   0,
+					"delta":           thought,
 					"sequence_number": seq,
 				})
 			}
 			if text != "" {
 				writeEvent("response.output_text.delta", gin.H{
-					"output_index":  0,
-					"content_index": contentIdx,
-					"delta":         text,
+					"output_index":    0,
+					"content_index":   contentIdx,
+					"delta":           text,
 					"sequence_number": seq,
 				})
 			}
 		})
+		if err := geminiParseError(parseStatus, parseErr); err != nil {
+			log.Printf("[Responses] Failed to parse Gemini stream: %v", err)
+			writeEvent("response.failed", gin.H{
+				"response": gin.H{
+					"id":         responseID,
+					"object":     "response",
+					"created_at": created,
+					"model":      model,
+					"status":     "failed",
+					"error": gin.H{
+						"message": err.Error(),
+						"type":    "upstream_parse_error",
+					},
+				},
+				"sequence_number": seq,
+			})
+		}
 		return false
 	})
 
 	writeEvent("response.output_text.done", gin.H{
-		"output_index":  0,
-		"content_index": contentIdx,
+		"output_index":    0,
+		"content_index":   contentIdx,
 		"sequence_number": seq,
 	})
 

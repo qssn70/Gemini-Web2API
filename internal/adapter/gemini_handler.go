@@ -137,11 +137,16 @@ func geminiGenerateContent(c *gin.Context, pool *balancer.AccountPool, model str
 	defer respBody.Close()
 
 	var fullText strings.Builder
-	parseGeminiResponse(respBody, func(text, thought string) {
+	parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 		if text != "" {
 			fullText.WriteString(text)
 		}
 	})
+	if err := geminiParseError(parseStatus, parseErr); err != nil {
+		log.Printf("[Gemini] 解析响应失败: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
 
 	resp := GeminiGenerateContentResponse{
 		Candidates: []GeminiCandidate{
@@ -212,7 +217,7 @@ func geminiStreamGenerateContent(c *gin.Context, pool *balancer.AccountPool, mod
 	c.Header("Transfer-Encoding", "chunked")
 
 	c.Stream(func(w io.Writer) bool {
-		parseGeminiResponse(respBody, func(text, thought string) {
+		parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 			if text == "" {
 				return
 			}
@@ -233,6 +238,12 @@ func geminiStreamGenerateContent(c *gin.Context, pool *balancer.AccountPool, mod
 			fmt.Fprintf(w, "data: %s\n\n", bytes)
 			w.(http.Flusher).Flush()
 		})
+		if err := geminiParseError(parseStatus, parseErr); err != nil {
+			log.Printf("[Gemini] 解析流式响应失败: %v", err)
+			bytes, _ := json.Marshal(gin.H{"error": err.Error()})
+			fmt.Fprintf(w, "data: %s\n\n", bytes)
+			w.(http.Flusher).Flush()
+		}
 		return false
 	})
 

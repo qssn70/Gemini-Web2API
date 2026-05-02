@@ -98,10 +98,21 @@ func ClaudeMessagesHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			var fullText string
 			var fullThinking string
 
-			parseGeminiResponse(respBody, func(text, thought string) {
+			parseStatus, parseErr := parseGeminiResponse(respBody, func(text, thought string) {
 				fullText += text
 				fullThinking += thought
 			})
+			if err := geminiParseError(parseStatus, parseErr); err != nil {
+				log.Printf("[Claude] Failed to parse Gemini response: %v", err)
+				c.JSON(http.StatusBadGateway, gin.H{
+					"type": "error",
+					"error": gin.H{
+						"type":    "upstream_parse_error",
+						"message": err.Error(),
+					},
+				})
+				return
+			}
 
 			var contentBlocks []claude.ContentBlock
 
