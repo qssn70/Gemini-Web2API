@@ -109,13 +109,56 @@ func GetCurrentUserAgent() string {
 	return currentUserAgent
 }
 
-func GetClientOptions(profile ProfileConfig, proxyURL string) []tls_client.HttpClientOption {
+// IPFamily values control which network family (IPv4 / IPv6) the
+// underlying tls-client dialer is allowed to use. The zero value behaves
+// like the operating system default (Happy Eyeballs / IPv6-preferred).
+//
+// We expose this because Google's Gemini infrastructure occasionally
+// flags one family from a given host (most commonly the host's IPv6
+// /64) while the other is fine — letting users pin a family lets them
+// route around regional / IP-block issues without changing the proxy.
+const (
+	IPFamilyAuto = "auto"
+	IPFamilyIPv4 = "ipv4"
+	IPFamilyIPv6 = "ipv6"
+)
+
+// NormalizeIPFamily canonicalises whatever the user wrote in .env (e.g.
+// "v4", "IPv4", "4", "ipv4") into one of the IPFamily* constants. Empty
+// input and unknown values fall back to IPFamilyAuto. Returned bool
+// tells the caller whether the input was recognised — useful for log
+// warnings about typos like "ipv44".
+func NormalizeIPFamily(raw string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "", "auto", "any", "default", "system":
+		return IPFamilyAuto, v == "" || v == "auto" || v == "any" || v == "default" || v == "system"
+	case "4", "v4", "ipv4", "tcp4":
+		return IPFamilyIPv4, true
+	case "6", "v6", "ipv6", "tcp6":
+		return IPFamilyIPv6, true
+	default:
+		return IPFamilyAuto, false
+	}
+}
+
+func GetClientOptions(profile ProfileConfig, proxyURL string, ipFamily string) []tls_client.HttpClientOption {
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(600),
 		tls_client.WithClientProfile(profile.Profile),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
 		tls_client.WithRandomTLSExtensionOrder(),
+	}
+
+	switch ipFamily {
+	case IPFamilyIPv4:
+		// Disabling IPv6 forces every dial to "tcp4". This is the
+		// fix for "my host's IPv6 prefix is geo-flagged but IPv4
+		// works" on Gemini.
+		options = append(options, tls_client.WithDisableIPV6())
+	case IPFamilyIPv6:
+		options = append(options, tls_client.WithDisableIPV4())
 	}
 
 	if strings.TrimSpace(proxyURL) != "" {

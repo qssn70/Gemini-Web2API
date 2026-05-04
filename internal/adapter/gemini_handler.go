@@ -144,7 +144,7 @@ func geminiGenerateContent(c *gin.Context, pool *balancer.AccountPool, model str
 	})
 	if err := geminiParseError(parseStatus, parseErr); err != nil {
 		log.Printf("[Gemini] 解析响应失败: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		respondWithGeminiError(c, err)
 		return
 	}
 

@@ -42,13 +42,15 @@ type Client struct {
 	ReqID         int
 	AccountID     string
 	ProxyURL      string
+	IPFamily      string
 	TemporaryChat bool
 }
 
-func NewClient(cookies map[string]string, proxyURL string) (*Client, error) {
+func NewClient(cookies map[string]string, proxyURL string, ipFamily string) (*Client, error) {
 	profile := GetRandomProfile()
 
-	options := GetClientOptions(profile, proxyURL)
+	family, _ := NormalizeIPFamily(ipFamily)
+	options := GetClientOptions(profile, proxyURL, family)
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	if err != nil {
 		return nil, err
@@ -71,10 +73,42 @@ func NewClient(cookies map[string]string, proxyURL string) (*Client, error) {
 		Cookies:    cookies,
 		ReqID:      GenerateReqID(),
 		ProxyURL:   strings.TrimSpace(proxyURL),
+		IPFamily:   family,
 	}, nil
 }
 
+// IsSNlM0eMissingError reports whether err is the specific "SNlM0e token not
+// found" error returned by tryInit when __Secure-1PSIDTS is stale. This is the
+// signal we use to decide whether to attempt a RotateCookies refresh.
+func IsSNlM0eMissingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "SNlM0e token not found")
+}
+
+// Init performs the initial GET on gemini.google.com/app and extracts the
+// page-bound tokens (SNlM0e, bl, f.sid) needed for subsequent generate calls.
+//
+// __Secure-1PSIDTS rotates server-side every few hours. When the supplied
+// cookie is stale, the init page is served without an SNlM0e token. In that
+// case we try once to refresh __Secure-1PSIDTS via Google's RotateCookies
+// endpoint and then re-run the init request before giving up.
 func (c *Client) Init() error {
+	if err := c.tryInit(); err != nil {
+		if !IsSNlM0eMissingError(err) {
+			return err
+		}
+
+		log.Printf("Account '%s': SNlM0e missing on init, attempting RotateCookies refresh of __Secure-1PSIDTS...", c.displayAccountID())
+		newTS, rotateErr := c.RotateCookies()
+		if rotateErr != nil {
+			return fmt.Errorf("%w; rotate cookies also failed: %v", err, rotateErr)
+		}
+		log.Printf("Account '%s': __Secure-1PSIDTS rotated (suffix ...%s), retrying init", c.displayAccountID(), shortCookieSuffix(newTS))
+		return c.tryInit()
+	}
+	return nil
+}
+
+func (c *Client) tryInit() error {
 	req, _ := http.NewRequest(http.MethodGet, EndpointInit, nil)
 	req.Header.Set("User-Agent", GetCurrentUserAgent())
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")

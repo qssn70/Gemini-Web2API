@@ -233,10 +233,7 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			})
 			if err := geminiParseError(parseStatus, parseErr); err != nil {
 				log.Printf("[OpenAI] Failed to parse Gemini response: %v", err)
-				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
-					"message": err.Error(),
-					"type":    "upstream_parse_error",
-				}})
+				respondWithGeminiError(c, err)
 				return
 			}
 
@@ -346,16 +343,104 @@ type geminiParseStatus struct {
 	PayloadCount int
 	CandidateSet int
 	MatchedNodes int
+	// DumpPath is set when the parser could not recognise the response and a
+	// raw copy was written to disk for offline inspection. Empty when the
+	// parse succeeded or when dumping was disabled / failed.
+	DumpPath string
+	// Preview is a short ASCII-safe excerpt of the raw body, included in
+	// error messages so an operator can spot the response type at a glance
+	// (e.g. an HTML login page) without opening the dump file.
+	Preview string
 }
 
 func geminiParseError(status geminiParseStatus, err error) error {
 	if err != nil {
+		// A typed BardError surfaces from the parser when the upstream
+		// returned a structured error envelope (1060 IP block, 1037 quota,
+		// etc.) instead of candidate content. Pass it through unchanged so
+		// the handler can map it to an appropriate HTTP status code.
+		if _, ok := gemini.IsBardError(err); ok {
+			return err
+		}
 		return fmt.Errorf("failed to read Gemini response stream: %w", err)
 	}
 	if !status.Recognized {
-		return fmt.Errorf("malformed Gemini response: no supported output structure found (frames=%d parts=%d payloads=%d candidate_sets=%d matched_nodes=%d)", status.FrameCount, status.PartCount, status.PayloadCount, status.CandidateSet, status.MatchedNodes)
+		base := fmt.Sprintf("malformed Gemini response: no supported output structure found (frames=%d parts=%d payloads=%d candidate_sets=%d matched_nodes=%d)",
+			status.FrameCount, status.PartCount, status.PayloadCount, status.CandidateSet, status.MatchedNodes)
+		if status.DumpPath != "" {
+			base += fmt.Sprintf("; raw body saved to %s", status.DumpPath)
+		}
+		if status.Preview != "" {
+			base += fmt.Sprintf("; preview: %s", status.Preview)
+		}
+		return fmt.Errorf("%s", base)
 	}
 	return nil
+}
+
+// geminiErrorStatus picks the HTTP status code that best matches err. Used
+// by the per-protocol handlers (OpenAI/Claude/Gemini/Responses) so they can
+// stop blanket-502'ing every parse failure.
+//
+// Mapping rationale:
+//   - 1037 USAGE_LIMIT_EXCEEDED → 429 (client should back off / try later)
+//   - 1060 IP_TEMPORARILY_BLOCKED → 429 (same: retryable after wait)
+//   - 1050/1052 MODEL_* → 400 (request-level fault, model name wrong)
+//   - 1013 TEMPORARY_ERROR_1013 → 502 (upstream-side, retryable later)
+//   - other / non-BardError → 502 (we can't tell, treat as upstream)
+func geminiErrorStatus(err error) int {
+	be, ok := gemini.IsBardError(err)
+	if !ok {
+		return http.StatusBadGateway
+	}
+	switch be.Code {
+	case gemini.BardErrUsageLimit, gemini.BardErrIPBlocked:
+		return http.StatusTooManyRequests
+	case gemini.BardErrModelInconsistent, gemini.BardErrModelHeaderBad:
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+// geminiErrorType returns the OpenAI/Claude-style error.type string for err.
+// "gemini_api_error" is reserved for typed BardError responses so clients
+// can distinguish a structured upstream error from a parse miss.
+func geminiErrorType(err error) string {
+	if _, ok := gemini.IsBardError(err); ok {
+		return "gemini_api_error"
+	}
+	return "upstream_parse_error"
+}
+
+// respondWithGeminiError writes a JSON error body shaped like OpenAI's
+// {"error": {...}} envelope with a status code derived from err. Used
+// by the OpenAI-compatible, Responses, and Gemini-native non-stream paths.
+func respondWithGeminiError(c *gin.Context, err error) {
+	body := gin.H{"error": gin.H{
+		"message": err.Error(),
+		"type":    geminiErrorType(err),
+	}}
+	if be, ok := gemini.IsBardError(err); ok {
+		body["error"].(gin.H)["code"] = be.Code
+	}
+	c.JSON(geminiErrorStatus(err), body)
+}
+
+// respondWithClaudeError mirrors respondWithGeminiError but with the
+// Anthropic Messages-API error envelope shape: {"type":"error","error":{...}}.
+func respondWithClaudeError(c *gin.Context, err error) {
+	inner := gin.H{
+		"type":    geminiErrorType(err),
+		"message": err.Error(),
+	}
+	if be, ok := gemini.IsBardError(err); ok {
+		inner["code"] = be.Code
+	}
+	c.JSON(geminiErrorStatus(err), gin.H{
+		"type":  "error",
+		"error": inner,
+	})
 }
 
 // Extract common parsing logic
@@ -367,6 +452,23 @@ func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) (
 	parts := extractGeminiResponseParts(string(body))
 	var lastText, lastThoughts string
 	status := geminiParseStatus{FrameCount: len(extractGeminiResponseFrames(string(body))), PartCount: len(parts)}
+
+	// First sweep: scan parts for an embedded BardErrorInfo envelope. Google
+	// uses these to convey upstream errors (1037 usage limit, 1060 IP block,
+	// 1013 transient, etc.) inline with normal frames; if we find one we
+	// short-circuit with a typed error so the handler can produce a
+	// useful HTTP status code instead of "malformed Gemini response".
+	//
+	// Path comes from upstream Python: part[5][2][0][1][0]. Example:
+	//   ["wrb.fr",null,null,null,null,
+	//     [9,null,
+	//       [["type.googleapis.com/.../BardErrorInfo", [1060]]]]]
+	for _, part := range parts {
+		errCode := extractBardErrorCode(part)
+		if errCode != 0 {
+			return status, gemini.NewBardError(errCode)
+		}
+	}
 
 	for _, part := range parts {
 		payloads := extractGeminiPayloadStrings(part)
@@ -479,7 +581,51 @@ func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) (
 		}
 	}
 
+	// If the parser walked the whole response without finding a structure
+	// it understands, persist the raw body for offline schema diagnosis.
+	// This is the bridge that lets us debug Google-side schema changes
+	// without asking the operator to recompile with extra logging.
+	if !status.Recognized {
+		status.DumpPath = dumpUnrecognisedBody("stream", body)
+		status.Preview = previewBytes(body, 240)
+		log.Printf("[ParseDump] Unrecognised Gemini response: frames=%d parts=%d payloads=%d candidate_sets=%d matched_nodes=%d; dump=%s; preview=%s",
+			status.FrameCount, status.PartCount, status.PayloadCount, status.CandidateSet, status.MatchedNodes,
+			status.DumpPath, status.Preview)
+	}
+
 	return status, nil
+}
+
+// extractBardErrorCode pulls a BardErrorInfo numeric code out of a parsed
+// frame, or returns 0 if no error envelope is present. The lookup follows
+// the upstream-Python convention: part[5][2][0][1][0] holds the code, and
+// part[5][2][0][0] holds the type URL we use to confirm we matched the
+// right envelope (rather than some unrelated array shape).
+//
+// Example matched part:
+//
+//	["wrb.fr", null, null, null, null,
+//	  [9, null,
+//	    [["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",
+//	      [1060]]]]]
+func extractBardErrorCode(part gjson.Result) int {
+	envelope := part.Get("5.2.0")
+	if !envelope.Exists() || !envelope.IsArray() {
+		return 0
+	}
+	typeURL := envelope.Get("0")
+	if typeURL.Type != gjson.String || !strings.Contains(typeURL.String(), "BardErrorInfo") {
+		return 0
+	}
+	codeArray := envelope.Get("1")
+	if !codeArray.IsArray() {
+		return 0
+	}
+	code := codeArray.Get("0")
+	if code.Type != gjson.Number {
+		return 0
+	}
+	return int(code.Int())
 }
 
 func extractGeminiCandidateSets(payload gjson.Result) []gjson.Result {

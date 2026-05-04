@@ -157,6 +157,20 @@ func (p *AccountPool) Size() int {
 	return len(p.entries)
 }
 
+// Snapshot returns a copy of the current entries slice so callers (e.g. the
+// background __Secure-1PSIDTS rotator) can iterate without holding the pool
+// lock during slow network calls. The returned slice can be mutated freely
+// by the caller; the AccountEntry pointers, however, remain shared with the
+// pool — that is intentional, since rotating cookies on the underlying
+// gemini.Client is exactly the side-effect we want to keep.
+func (p *AccountPool) Snapshot() []*AccountEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]*AccountEntry, len(p.entries))
+	copy(out, p.entries)
+	return out
+}
+
 func (p *AccountPool) HealthyCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

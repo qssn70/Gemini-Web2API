@@ -96,10 +96,11 @@ func loadCookiesFromBrowser() (map[string]string, error) {
 	return cookies, nil
 }
 
-func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []string, error) {
+func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []string, []string, error) {
 	var results []map[string]string
 	var usedIDs []string
 	var proxyURLs []string
+	var ipFamilies []string
 
 	envMap := make(map[string]string)
 
@@ -109,14 +110,15 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 		cookies, browserErr := loadCookiesFromBrowser()
 		if browserErr != nil {
 			createEnvTemplate()
-			return nil, nil, nil, fmt.Errorf("failed to auto-detect cookies: %v. A template .env file has been created", browserErr)
+			return nil, nil, nil, nil, fmt.Errorf("failed to auto-detect cookies: %v. A template .env file has been created", browserErr)
 		}
 		saveToEnv(cookies)
 		results = append(results, cookies)
 		usedIDs = append(usedIDs, "")
 		proxyURLs = append(proxyURLs, strings.TrimSpace(os.Getenv("PROXY")))
+		ipFamilies = append(ipFamilies, strings.TrimSpace(os.Getenv("IP_FAMILY")))
 		fmt.Println("Auto-detected cookies from browser and saved to .env")
-		return results, usedIDs, proxyURLs, nil
+		return results, usedIDs, proxyURLs, ipFamilies, nil
 	}
 
 	lines := strings.Split(string(content), "\n")
@@ -151,14 +153,15 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 		fmt.Println("No accounts configured in .env, attempting to auto-detect cookies from browser...")
 		cookies, browserErr := loadCookiesFromBrowser()
 		if browserErr != nil {
-			return nil, nil, nil, fmt.Errorf("no accounts in .env and failed to auto-detect: %v", browserErr)
+			return nil, nil, nil, nil, fmt.Errorf("no accounts in .env and failed to auto-detect: %v", browserErr)
 		}
 		saveToEnv(cookies)
 		results = append(results, cookies)
 		usedIDs = append(usedIDs, "")
 		proxyURLs = append(proxyURLs, strings.TrimSpace(envMap["PROXY"]))
+		ipFamilies = append(ipFamilies, strings.TrimSpace(envMap["IP_FAMILY"]))
 		fmt.Println("Auto-detected cookies from browser and saved to .env")
-		return results, usedIDs, proxyURLs, nil
+		return results, usedIDs, proxyURLs, ipFamilies, nil
 	}
 
 	fmt.Printf("Auto-detected accounts: %v\n", accountIDs)
@@ -190,9 +193,11 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 			"__Secure-1PSIDTS": psidts,
 		}
 		proxyURL := resolveProxyURL(envMap, id)
+		ipFamily := resolveIPFamily(envMap, id)
 		results = append(results, cookies)
 		usedIDs = append(usedIDs, id)
 		proxyURLs = append(proxyURLs, proxyURL)
+		ipFamilies = append(ipFamilies, ipFamily)
 		displayID := id
 		if displayID == "" {
 			displayID = "default"
@@ -201,10 +206,10 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 	}
 
 	if len(results) == 0 {
-		return nil, nil, nil, fmt.Errorf("no valid accounts found in .env")
+		return nil, nil, nil, nil, fmt.Errorf("no valid accounts found in .env")
 	}
 
-	return results, usedIDs, proxyURLs, nil
+	return results, usedIDs, proxyURLs, ipFamilies, nil
 }
 
 func createEnvTemplate() {
@@ -349,4 +354,27 @@ func resolveProxyURL(envMap map[string]string, accountID string) string {
 	}
 
 	return proxyURL
+}
+
+// resolveIPFamily picks the IP family override for a given account, mirroring
+// the PROXY / PROXY_<id> lookup pattern: a per-account IP_FAMILY_<id> wins
+// over the global IP_FAMILY. The raw string is returned as-is — normalisation
+// to canonical "ipv4" / "ipv6" / "auto" happens later in
+// gemini.NormalizeIPFamily so a typo in .env emits a single warning at the
+// right moment instead of silently round-tripping through an empty string.
+//
+// Use this when an account's IPv6 prefix is geo-flagged but IPv4 still
+// works (a common Gemini-side block pattern), and you want to pin the
+// dialer to one family without touching the proxy.
+func resolveIPFamily(envMap map[string]string, accountID string) string {
+	global := strings.TrimSpace(envMap["IP_FAMILY"])
+	if accountID == "" {
+		return global
+	}
+
+	accountKey := fmt.Sprintf("IP_FAMILY_%s", accountID)
+	if v := strings.TrimSpace(envMap[accountKey]); v != "" {
+		return v
+	}
+	return global
 }

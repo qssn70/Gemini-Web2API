@@ -188,10 +188,7 @@ func handleResponsesNonStream(c *gin.Context, respBody io.ReadCloser, responseID
 	})
 	if err := geminiParseError(parseStatus, parseErr); err != nil {
 		log.Printf("[Responses] Failed to parse Gemini response: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
-			"message": err.Error(),
-			"type":    "upstream_parse_error",
-		}})
+		respondWithGeminiError(c, err)
 		return
 	}
 
