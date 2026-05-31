@@ -1,3 +1,5 @@
+感觉协议2api已经走到头了，风控问题难以解决，后续可能转向无头浏览器
+
 # Gemini-Web2API (Go Version)
 
 将 Google Gemini Web 网页版转换为 OpenAI/Claude/Gemini 兼容的 API 格式。
