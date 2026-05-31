@@ -594,6 +594,36 @@ func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) (
 		log.Printf("[ParseDump] Unrecognised Gemini response: frames=%d parts=%d payloads=%d candidate_sets=%d matched_nodes=%d; dump=%s; preview=%s",
 			status.FrameCount, status.PartCount, status.PayloadCount, status.CandidateSet, status.MatchedNodes,
 			status.DumpPath, status.Preview)
+
+		// Extra diagnostics: for each part that has an inner JSON string,
+		// log what keys the inner object has so we can spot where
+		// candidates might have moved.
+		diagLogged := 0
+		for pi, part := range parts {
+			if diagLogged >= 5 {
+				break
+			}
+			payloads := extractGeminiPayloadStrings(part)
+			for _, dataStr := range payloads {
+				if diagLogged >= 5 {
+					break
+				}
+				inner := gjson.Parse(dataStr)
+				if !inner.IsArray() && !inner.IsObject() {
+					continue
+				}
+				if inner.Get("4").Exists() {
+					continue
+				}
+				var keys []string
+				inner.ForEach(func(key, _ gjson.Result) bool {
+					keys = append(keys, key.String())
+					return true
+				})
+				log.Printf("[ParseDump] Part %d payload keys: %v (no [4] candidates)", pi, keys)
+				diagLogged++
+			}
+		}
 	}
 
 	return status, nil

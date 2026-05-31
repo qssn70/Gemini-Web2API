@@ -65,15 +65,22 @@ func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *Chat
 		}
 	}
 
-	// [0] message content
+	// [0] message content — mirrors Python's message_content list:
+	//   [prompt, 0, None, req_file_data, None, None, 0]
+	// When no files are attached, req_file_data is None (not []).
+	// And [6] is integer 0, not None.
 	msgStruct := `[]`
 	msgStruct, _ = sjson.Set(msgStruct, "0", prompt)
 	msgStruct, _ = sjson.Set(msgStruct, "1", 0)
 	msgStruct, _ = sjson.Set(msgStruct, "2", nil)
-	msgStruct, _ = sjson.SetRaw(msgStruct, "3", imagesJSON)
+	if len(files) > 0 {
+		msgStruct, _ = sjson.SetRaw(msgStruct, "3", imagesJSON)
+	} else {
+		msgStruct, _ = sjson.Set(msgStruct, "3", nil)
+	}
 	msgStruct, _ = sjson.Set(msgStruct, "4", nil)
 	msgStruct, _ = sjson.Set(msgStruct, "5", nil)
-	msgStruct, _ = sjson.Set(msgStruct, "6", nil)
+	msgStruct, _ = sjson.Set(msgStruct, "6", 0)
 
 	inner := `[]`
 	inner, _ = sjson.SetRaw(inner, "0", msgStruct)

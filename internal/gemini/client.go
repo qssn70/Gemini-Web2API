@@ -250,6 +250,7 @@ func (c *Client) doGenerateContentRequest(prompt string, model string, files []F
 	req, _ := http.NewRequest(http.MethodPost, EndpointGenerate, strings.NewReader(data))
 
 	q := req.URL.Query()
+	q.Add("hl", GetLanguage())
 	q.Add("bl", c.VersionBL)
 	q.Add("_reqid", fmt.Sprintf("%d", c.ReqID))
 	q.Add("rt", "c")
