@@ -25,10 +25,13 @@
 
 | 模型名 | 说明 |
 |--------|------|
-| `gemini-2.5-flash` | 快速模型 |
-| `gemini-3.1-pro-preview` | Pro 预览版 |
-| `gemini-3-flash-preview` | Flash 预览版 |
-| `gemini-3-flash-preview-no-thinking` | Flash 无思考模式 |
+| `gemini-2.5-flash` | Flash 基础版 |
+| `gemini-3.1-pro-preview` | Pro Plus 预览版 |
+| `gemini-3-flash-preview` | Flash Thinking Plus 预览版 |
+| `gemini-3-flash-preview-no-thinking` | Flash Plus 无思考模式 |
+| `gemini-3-pro` | Pro 基础版 |
+| `gemini-3-flash` | Flash 基础版 |
+| `gemini-3-flash-thinking` | Flash Thinking 基础版 |
 | `gemini-2.5-flash-image` | Nano Banana 生图 |
 | `gemini-3-pro-image-preview` | Nano Banana Pro 生图 |
 

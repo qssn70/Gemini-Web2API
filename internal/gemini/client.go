@@ -34,9 +34,12 @@ const (
 // These are sent alongside x-goog-ext-73010989-jspb and x-goog-ext-73010990-jspb
 // in doGenerateContentRequest.
 var ModelHeaders = map[string]string{
-	// Basic tier
+	// Basic tier (free accounts)
 	"gemini-2.5-flash":                   `[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4],null,null,1]`,
 	"gemini-3-flash-preview-no-thinking": `[1,null,null,null,"fbb127bbb056c959",null,null,0,[4],null,null,1]`,
+	"gemini-3-pro":                       `[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4],null,null,1]`,
+	"gemini-3-flash":                     `[1,null,null,null,"fbb127bbb056c959",null,null,0,[4],null,null,1]`,
+	"gemini-3-flash-thinking":            `[1,null,null,null,"5bf011840784117a",null,null,0,[4],null,null,1]`,
 	// Plus tier
 	"gemini-3.1-pro-preview":     `[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,4]`,
 	"gemini-3-flash-preview":     `[1,null,null,null,"e051ce1aa80aa576",null,null,0,[4],null,null,4]`,

@@ -47,6 +47,9 @@ func ListModelsHandler(c *gin.Context) {
 		{ID: "gemini-3-flash-preview-no-thinking", Object: "model", Created: time.Now().Unix(), OwnedBy: "Google"},
 		{ID: "gemini-2.5-flash-image", Object: "model", Created: time.Now().Unix(), OwnedBy: "Google"},
 		{ID: "gemini-3-pro-image-preview", Object: "model", Created: time.Now().Unix(), OwnedBy: "Google"},
+		{ID: "gemini-3-pro", Object: "model", Created: time.Now().Unix(), OwnedBy: "Google"},
+		{ID: "gemini-3-flash", Object: "model", Created: time.Now().Unix(), OwnedBy: "Google"},
+		{ID: "gemini-3-flash-thinking", Object: "model", Created: time.Now().Unix(), OwnedBy: "Google"},
 	}
 
 	c.JSON(http.StatusOK, gin.H{
