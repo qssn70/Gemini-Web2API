@@ -125,18 +125,20 @@ func Start(cfg *Config, baseDir string) (*Tunnel, error) {
 		return nil, fmt.Errorf("bring up warp device: %w", err)
 	}
 
-	// Try the preferred port first, fall back to ephemeral.
+	// Listen on the HOST's loopback — not inside the tunnel's netstack.
+	// tls-client connects to 127.0.0.1, which lives in the host network
+	// namespace. The SOCKS5 handler then dials targets through tnet.
 	port, _ := strconv.Atoi(SOCKS5Port)
-	ln, err := tnet.ListenTCP(&net.TCPAddr{Port: port})
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
 	if err != nil {
-		ln, err = tnet.ListenTCP(&net.TCPAddr{Port: 0})
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			dev.Close()
 			return nil, fmt.Errorf("listen socks5: %w", err)
 		}
 	}
 
-	sAddr := "socks5://127.0.0.1:" + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	sAddr := "socks5://" + ln.Addr().String()
 
 	t := &Tunnel{sAddr: sAddr, ln: ln, dev: dev}
 	go t.serveSocks5(tnet)

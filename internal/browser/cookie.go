@@ -343,13 +343,24 @@ func saveToEnv(cookies map[string]string) {
 }
 
 func resolveProxyURL(envMap map[string]string, accountID string) string {
+	// envMap comes from parsing the .env file on disk. When a module
+	// like WARP sets os.Setenv("PROXY", ...) at runtime, the file
+	// doesn't reflect that. Fall back to the environment so that
+	// programmatically-set values are picked up.
 	proxyURL := strings.TrimSpace(envMap["PROXY"])
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(os.Getenv("PROXY"))
+	}
 	if accountID == "" {
 		return proxyURL
 	}
 
 	accountProxyKey := fmt.Sprintf("PROXY_%s", accountID)
 	if accountProxy := strings.TrimSpace(envMap[accountProxyKey]); accountProxy != "" {
+		return accountProxy
+	}
+	// Also check per-account env var set at runtime.
+	if accountProxy := strings.TrimSpace(os.Getenv(accountProxyKey)); accountProxy != "" {
 		return accountProxy
 	}
 
