@@ -11,6 +11,7 @@ import (
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/google/uuid"
 )
 
 const (
@@ -19,13 +20,29 @@ const (
 	EndpointGenerate = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 )
 
+// ModelHeaders maps model names to the x-goog-ext-525001261-jspb header value.
+// The format follows the current Gemini web client protocol:
+//
+//	[1,null,null,null,model_id,null,null,0,[4],null,null,capacity_tail]
+//
+// capacity_tail values:
+//
+//	1 = Basic tier
+//	2 = Advanced tier
+//	4 = Plus tier
+//
+// These are sent alongside x-goog-ext-73010989-jspb and x-goog-ext-73010990-jspb
+// in doGenerateContentRequest.
 var ModelHeaders = map[string]string{
-	"gemini-2.5-flash":                   `[1,null,null,null,"71c2d248d3b102ff"]`,
-	"gemini-3.1-pro-preview":             `[1,null,null,null,"e6fa609c3fa255c0"]`,
-	"gemini-3-flash-preview":             `[1,null,null,null,"e051ce1aa80aa576"]`,
-	"gemini-3-flash-preview-no-thinking": `[1,null,null,null,"56fdd199312815e2"]`,
-	"gemini-2.5-flash-image":             `[1,null,null,null,"56fdd199312815e2",null,null,0,[4],null,null,2]`,
-	"gemini-3-pro-image-preview":         `[1,null,null,null,"e051ce1aa80aa576",null,null,0,[4],null,null,2]`,
+	// Basic tier
+	"gemini-2.5-flash":                   `[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4],null,null,1]`,
+	"gemini-3-flash-preview-no-thinking": `[1,null,null,null,"fbb127bbb056c959",null,null,0,[4],null,null,1]`,
+	// Plus tier
+	"gemini-3.1-pro-preview":     `[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,4]`,
+	"gemini-3-flash-preview":     `[1,null,null,null,"e051ce1aa80aa576",null,null,0,[4],null,null,4]`,
+	// Advanced tier (image models)
+	"gemini-2.5-flash-image":     `[1,null,null,null,"56fdd199312815e2",null,null,0,[4],null,null,2]`,
+	"gemini-3-pro-image-preview": `[1,null,null,null,"e051ce1aa80aa576",null,null,0,[4],null,null,2]`,
 }
 
 type GenerateResult struct {
@@ -255,6 +272,17 @@ func (c *Client) doGenerateContentRequest(prompt string, model string, files []F
 		req.Header.Set("x-goog-ext-525001261-jspb", ModelHeaders["gemini-2.5-flash"])
 	}
 
+	// Additional headers required by the current Gemini web protocol.
+	// Without these, the server returns metadata-only frames with no
+	// candidate content, causing "no supported output structure found".
+	req.Header.Set("x-goog-ext-73010989-jspb", "[0]")
+	req.Header.Set("x-goog-ext-73010990-jspb", "[0]")
+
+	// Per-request UUID header — the server uses this to correlate
+	// the request with the response stream.
+	requestUUID := strings.ToUpper(generateUUID())
+	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, requestUUID))
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -369,4 +397,9 @@ func IsSessionError(err error) bool {
 	return strings.Contains(msg, "inconsistent with the conversation") ||
 		strings.Contains(msg, "chat not found") ||
 		strings.Contains(msg, "session not found")
+}
+
+// generateUUID returns a new random UUID string (equivalent to Python's uuid.uuid4()).
+func generateUUID() string {
+	return uuid.New().String()
 }
