@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -22,6 +23,7 @@ type Tunnel struct {
 	sAddr string
 	ln    net.Listener
 	dev   *device.Device
+	tnet  *netstack.Net
 }
 
 var (
@@ -98,7 +100,7 @@ func Start(cfg *Config, baseDir string) (*Tunnel, error) {
 	if tunAddr == "" {
 		tunAddr = "172.16.0.2"
 	}
-	dnsAddr := "172.16.0.1"
+	dnsAddr := "1.1.1.1"
 
 	tun, tnet, err := netstack.CreateNetTUN(
 		[]netip.Addr{netip.MustParseAddr(tunAddr)},
@@ -114,15 +116,41 @@ func Start(cfg *Config, baseDir string) (*Tunnel, error) {
 	var peerKey [32]byte
 	copy(peerKey[:], peerPubBytes)
 
-	wgCfg := fmt.Sprintf("private_key=%x\npublic_key=%x\nendpoint=%s\npersistent_keepalive_interval=25\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n",
-		localKey, peerKey, endpoint)
+	// Build the WireGuard IPC config string.  Each line is key=value.
+	// We need: our private key, the peer's public key, the peer's
+	// endpoint, keepalive, and the allowed-ips (all traffic through
+	// the tunnel).
+	wgCfg := fmt.Sprintf(
+		"private_key=%x\n"+
+			"public_key=%x\n"+
+			"endpoint=%s\n"+
+			"persistent_keepalive_interval=25\n"+
+			"allowed_ip=0.0.0.0/0\n"+
+			"allowed_ip=::/0\n",
+		localKey, peerKey, endpoint,
+	)
 
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, "[WARP] "))
+	loggerLevel := device.LogLevelSilent
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(loggerLevel, "[WARP] "))
 	if err := dev.IpcSet(wgCfg); err != nil {
 		return nil, fmt.Errorf("configure warp device: %w", err)
 	}
 	if err := dev.Up(); err != nil {
 		return nil, fmt.Errorf("bring up warp device: %w", err)
+	}
+
+	// Wait for the WireGuard handshake to complete. dev.Up() returns
+	// immediately but the actual key exchange with the Cloudflare
+	// endpoint is asynchronous — if we start routing traffic before
+	// the handshake finishes, the first packets will be dropped and
+	// the client sees "connection refused" or timeouts.
+	log.Printf("[WARP] Waiting for WireGuard handshake with %s ...", endpoint)
+	if err := waitForHandshake(tnet, 15*time.Second); err != nil {
+		// Not fatal — the handshake may complete on the first real
+		// connection attempt — but log it so the operator knows.
+		log.Printf("[WARP] Warning: handshake probe timed out (%v). Tunnel is up; first request may be slow.", err)
+	} else {
+		log.Printf("[WARP] WireGuard handshake completed successfully")
 	}
 
 	// Listen on the HOST's loopback — not inside the tunnel's netstack.
@@ -140,12 +168,45 @@ func Start(cfg *Config, baseDir string) (*Tunnel, error) {
 
 	sAddr := "socks5://" + ln.Addr().String()
 
-	t := &Tunnel{sAddr: sAddr, ln: ln, dev: dev}
+	t := &Tunnel{sAddr: sAddr, ln: ln, dev: dev, tnet: tnet}
 	go t.serveSocks5(tnet)
 
 	runningTunnel = t
 	log.Printf("[WARP] Tunnel up, SOCKS5 proxy at %s (tunnel IP: %s, peer: %s)", sAddr, tunAddr, endpoint)
 	return t, nil
+}
+
+// waitForHandshake probes the tunnel by making a TCP connection to a
+// well-known Cloudflare endpoint through tnet. The WireGuard handshake
+// is triggered by the first outbound packet; once it completes, the
+// TCP SYN-ACK comes back and we know the tunnel is ready for traffic.
+func waitForHandshake(tnet *netstack.Net, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 1.1.1.1 is Cloudflare's own DNS resolver — it's fast, always up,
+	// and on the same network as WARP so it's an ideal handshake probe.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(timeout)
+	}
+
+	for {
+		conn, err := tnet.DialContext(ctx, "tcp", "1.1.1.1:443")
+		if err == nil {
+			conn.Close()
+			return nil // handshake done
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("handshake probe: %w", err)
+		}
+		// Back off briefly to avoid spinning.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // SOCKS5Addr returns the SOCKS5 proxy URL for use with tls-client.
@@ -274,7 +335,16 @@ func handleSocks5Conn(client net.Conn, tnet *netstack.Net) {
 		if _, err := client.Read(buf[:dLen]); err != nil {
 			return
 		}
-		host = string(buf[:dLen])
+		domain := string(buf[:dLen])
+		// Resolve DNS on the host side — the tunnel's netstack has no
+		// DNS resolver of its own, so passing a raw hostname to
+		// tnet.DialContext would just time out.
+		ips, err := net.LookupHost(domain)
+		if err != nil || len(ips) == 0 {
+			client.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+		host = ips[0]
 	case 0x04: // IPv6
 		if _, err := client.Read(buf[:16]); err != nil {
 			return
