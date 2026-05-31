@@ -19,6 +19,7 @@ import (
 	"gemini-web2api/internal/config"
 	"gemini-web2api/internal/gemini"
 	"gemini-web2api/internal/storage"
+	"gemini-web2api/internal/warp"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
@@ -98,6 +99,23 @@ func main() {
 		log.Printf("[Startup] Auth enabled (source: %s)", authSource)
 	} else {
 		log.Printf("[Startup] Auth disabled (no PROXY_API_KEY loaded from .env or environment)")
+	}
+
+	// Start WARP tunnel if enabled. This happens before loadAccountsAsync
+	// so the SOCKS5 proxy address is available when creating clients.
+	warpCfg := warp.ReadConfig(cookieCacheBaseDir())
+	if warpCfg.Enable {
+		tunnel, warpErr := warp.Start(&warpCfg, cookieCacheBaseDir())
+		if warpErr != nil {
+			log.Fatalf("[Startup] WARP tunnel failed: %v", warpErr)
+		}
+		// Set the WARP SOCKS5 address as the default proxy so
+		// loadAccountsAsync picks it up for any account that does
+		// not have an explicit PROXY_* override.
+		if os.Getenv("PROXY") == "" {
+			os.Setenv("PROXY", tunnel.SOCKS5Addr())
+			log.Printf("[Startup] WARP proxy set as default PROXY=%s", tunnel.SOCKS5Addr())
+		}
 	}
 
 	pool = balancer.NewAccountPool()
@@ -184,6 +202,7 @@ func main() {
 		log.Println("[Storage] Database closed")
 	}
 
+	warp.Close()
 	log.Println("Server exited")
 }
 
