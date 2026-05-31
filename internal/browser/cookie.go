@@ -347,6 +347,9 @@ func resolveProxyURL(envMap map[string]string, accountID string) string {
 	// like WARP sets os.Setenv("PROXY", ...) at runtime, the file
 	// doesn't reflect that. Fall back to the environment so that
 	// programmatically-set values are picked up.
+	//
+	// An empty value in .env (e.g. "PROXY=") must NOT win over a
+	// runtime-set value — treat empty as "not configured in file".
 	proxyURL := strings.TrimSpace(envMap["PROXY"])
 	if proxyURL == "" {
 		proxyURL = strings.TrimSpace(os.Getenv("PROXY"))

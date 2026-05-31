@@ -360,8 +360,17 @@ func handleSocks5Conn(client net.Conn, tnet *netstack.Net) {
 	port := int(buf[0])<<8 | int(buf[1])
 
 	target := net.JoinHostPort(host, strconv.Itoa(port))
-	remote, err := tnet.DialContext(context.Background(), "tcp", target)
+
+	// Set a generous connect deadline so the SOCKS5 client (tls-client)
+	// doesn't give up before the WireGuard tunnel has finished its
+	// handshake with the peer.  The first connection after a fresh
+	// tunnel bring-up may need up to ~5s for the key exchange.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer dialCancel()
+
+	remote, err := tnet.DialContext(dialCtx, "tcp", target)
 	if err != nil {
+		log.Printf("[WARP/SOCKS5] DialContext(%s) failed: %v", target, err)
 		client.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}

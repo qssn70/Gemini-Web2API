@@ -112,10 +112,8 @@ func main() {
 		// Set the WARP SOCKS5 address as the default proxy so
 		// loadAccountsAsync picks it up for any account that does
 		// not have an explicit PROXY_* override.
-		if os.Getenv("PROXY") == "" {
-			os.Setenv("PROXY", tunnel.SOCKS5Addr())
-			log.Printf("[Startup] WARP proxy set as default PROXY=%s", tunnel.SOCKS5Addr())
-		}
+		os.Setenv("PROXY", tunnel.SOCKS5Addr())
+		log.Printf("[Startup] WARP proxy set as default PROXY=%s", tunnel.SOCKS5Addr())
 	}
 
 	pool = balancer.NewAccountPool()
@@ -129,7 +127,7 @@ func main() {
 		log.Printf("[Storage] Database opened at %s", cfg.Storage.Path)
 	}
 
-	go loadAccountsAsync()
+		go loadAccountsAsync()
 	go watchEnvFile(filepath.Dir(execPath))
 	go runCookieRefresher()
 
