@@ -23,32 +23,16 @@ type ChatMetadata struct {
 
 // BuildGeneratePayload constructs the f.req form value sent to
 // StreamGenerate.  The payload follows Google's 69-element inner
-// request list format used by the current Gemini web client. Earlier
-// versions of this code sent a truncated ~7-element list which
-// caused the server to return metadata-only frames without candidate
-// content, resulting in "no supported output structure found" errors.
+// request list format used by the current Gemini web client.
 //
-// Field mapping (from upstream Python gemini_webapi):
+// The f.req form value is the URL-encoded version of:
 //
-//	[0]  message content (prompt + files)
-//	[1]  language array
-//	[2]  chat metadata [cid, rid, rcid] or DEFAULT_METADATA
-//	[3]  deep search token (unused)
-//	[4]  UUID (deep research, unused)
-//	[6]  [1]
-//	[7]  streaming flag = 1
-//	[10] = 1
-//	[11] = 0
-//	[17] = [[0]]
-//	[18] = 0
-//	[27] = 1
-//	[30] = [4]
-//	[41] = [1]
-//	[45] = 1 (temporary chat flag)
-//	[53] = 0
-//	[59] = UUID (uppercase)
-//	[61] = []
-//	[68] = 2
+//	json.dumps([None, json.dumps(inner_req_list)])
+//
+// where inner_req_list is a 69-element array with specific indices set.
+// The double-encoding (inner list as a string inside the outer array)
+// is critical — the server expects outer[1] to be a JSON string that
+// it json.loads again.
 func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *ChatMetadata, temporaryChat bool) string {
 	imagesJSON := `[]`
 	if len(files) > 0 {
@@ -65,7 +49,14 @@ func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *Chat
 		}
 	}
 
-	// [0] message content — mirrors Python's message_content list:
+	// Build the inner request list as a Go string. We use sjson operations
+	// to construct the JSON array, then sjson.Set(outer, "1", inner) to
+	// embed it as a JSON-encoded string value inside the outer envelope.
+	//
+	// sjson.Set with a string argument JSON-escapes it, producing exactly
+	// the double-encoding the server expects: outer = [null,"<escaped>",null,null]
+
+	// [0] message content — mirrors Python's message_content:
 	//   [prompt, 0, None, req_file_data, None, None, 0]
 	// When no files are attached, req_file_data is None (not []).
 	// And [6] is integer 0, not None.
@@ -137,9 +128,8 @@ func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *Chat
 	inner, _ = sjson.Set(inner, "68", 2)
 
 	// Wrap in the outer envelope: [null, inner_json_string, null, null]
-	// The server expects index 1 to be a JSON-encoded string of the inner
-	// request list, NOT the raw list. This mirrors the Python client:
-	//   json.dumps([None, json.dumps(inner_req_list)])
+	// sjson.Set treats inner as a string value and JSON-escapes it,
+	// producing the double-encoding the server expects.
 	outer := `[null,"",null,null]`
 	outer, _ = sjson.Set(outer, "1", inner)
 

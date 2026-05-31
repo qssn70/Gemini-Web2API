@@ -594,36 +594,6 @@ func parseGeminiResponse(reader io.Reader, onChunk func(text, thought string)) (
 		log.Printf("[ParseDump] Unrecognised Gemini response: frames=%d parts=%d payloads=%d candidate_sets=%d matched_nodes=%d; dump=%s; preview=%s",
 			status.FrameCount, status.PartCount, status.PayloadCount, status.CandidateSet, status.MatchedNodes,
 			status.DumpPath, status.Preview)
-
-		// Extra diagnostics: for each part that has an inner JSON string,
-		// log what keys the inner object has so we can spot where
-		// candidates might have moved.
-		diagLogged := 0
-		for pi, part := range parts {
-			if diagLogged >= 5 {
-				break
-			}
-			payloads := extractGeminiPayloadStrings(part)
-			for _, dataStr := range payloads {
-				if diagLogged >= 5 {
-					break
-				}
-				inner := gjson.Parse(dataStr)
-				if !inner.IsArray() && !inner.IsObject() {
-					continue
-				}
-				if inner.Get("4").Exists() {
-					continue
-				}
-				var keys []string
-				inner.ForEach(func(key, _ gjson.Result) bool {
-					keys = append(keys, key.String())
-					return true
-				})
-				log.Printf("[ParseDump] Part %d payload keys: %v (no [4] candidates)", pi, keys)
-				diagLogged++
-			}
-		}
 	}
 
 	return status, nil
@@ -805,21 +775,29 @@ func extractGeminiPayloadStrings(part gjson.Result) []string {
 		}
 	}
 
-	if part.IsArray() {
-		part.ForEach(func(_, value gjson.Result) bool {
-			if value.Type != gjson.String {
-				return true
+	// Workaround for gjson limitation: when a wrb.fr row contains a very
+	// long escaped JSON string at index 2 (the inner payload), the original
+	// part.Get("2") may return Null because the part is a sub-result whose
+	// Raw pointer spans the full frame. Re-parsing part.Raw as a standalone
+	// JSON value gives gjson correct bounds and index 2 becomes accessible.
+	if len(payloads) == 0 && part.IsArray() {
+		if first := part.Get("0"); first.Exists() && first.Type == gjson.String {
+			if strings.HasPrefix(first.String(), "wrb.") {
+				reparsed := gjson.Parse(part.Raw)
+				if reparsed.Exists() {
+					for _, path := range []string{"2", "1", "0"} {
+						value := reparsed.Get(path)
+						if !value.Exists() || value.Type != gjson.String {
+							continue
+						}
+						payload := strings.TrimSpace(value.String())
+						if strings.HasPrefix(payload, "[") || strings.HasPrefix(payload, "{") {
+							payloads = append(payloads, payload)
+						}
+					}
+				}
 			}
-			payload := strings.TrimSpace(value.String())
-			if strings.HasPrefix(payload, "[") || strings.HasPrefix(payload, "{") {
-				payloads = append(payloads, payload)
-			}
-			return true
-		})
-	}
-
-	if strings.HasPrefix(strings.TrimSpace(part.Raw), "[") || strings.HasPrefix(strings.TrimSpace(part.Raw), "{") {
-		payloads = append(payloads, part.Raw)
+		}
 	}
 
 	return payloads

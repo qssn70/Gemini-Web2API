@@ -111,7 +111,30 @@ func IsSNlM0eMissingError(err error) bool {
 // cookie is stale, the init page is served without an SNlM0e token. In that
 // case we try once to refresh __Secure-1PSIDTS via Google's RotateCookies
 // endpoint and then re-run the init request before giving up.
+// preflightGET visits https://www.google.com to establish session cookies
+// (NID, 1P_JAR, CONSENT, AEC, etc.) that the Python client captures via
+// a similar preflight step. These cookies are required for the server to
+// treat subsequent Generate requests as a valid browser session — without
+// them the server returns metadata-only frames with no candidate content.
+func (c *Client) preflightGET() {
+	req, _ := http.NewRequest(http.MethodGet, EndpointGoogle, nil)
+	req.Header.Set("User-Agent", GetCurrentUserAgent())
+	req.Header.Set("Accept-Language", getLangHeader())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		log.Printf("Account '%s': preflight GET google.com failed (non-fatal): %v", c.displayAccountID(), err)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	log.Printf("Account '%s': preflight GET google.com → %d", c.displayAccountID(), resp.StatusCode)
+}
+
 func (c *Client) Init() error {
+	// Preflight: establish NID and other session cookies from google.com.
+	c.preflightGET()
+
 	if err := c.tryInit(); err != nil {
 		if !IsSNlM0eMissingError(err) {
 			return err
@@ -294,6 +317,17 @@ func (c *Client) doGenerateContentRequest(prompt string, model string, files []F
 	// returns metadata-only frames.
 	log.Printf("[RequestDebug] POST %s", req.URL.String())
 	log.Printf("[RequestDebug] Model: %s", model)
+
+	// Log cookies that the jar will send with this request.
+	// This verifies that preflight cookies (NID etc.) are present.
+	for _, ck := range c.httpClient.GetCookies(req.URL) {
+		if len(ck.Value) > 40 {
+			log.Printf("[RequestDebug] Cookie: %s=%s...", ck.Name, ck.Value[:40])
+		} else {
+			log.Printf("[RequestDebug] Cookie: %s=%s", ck.Name, ck.Value)
+		}
+	}
+
 	log.Printf("[RequestDebug] Headers:")
 	for k, vv := range req.Header {
 		for _, v := range vv {
