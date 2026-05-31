@@ -259,6 +259,8 @@ func (c *Client) doGenerateContentRequest(prompt string, model string, files []F
 	}
 	req.URL.RawQuery = q.Encode()
 
+	// Set ALL headers BEFORE logging, so the debug output reflects
+	// what is actually sent to the server.
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
 	req.Header.Set("User-Agent", GetCurrentUserAgent())
 	req.Header.Set("Origin", "https://gemini.google.com")
@@ -286,6 +288,27 @@ func (c *Client) doGenerateContentRequest(prompt string, model string, files []F
 	// the request with the response stream.
 	requestUUID := strings.ToUpper(generateUUID())
 	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, requestUUID))
+
+	// Debug: log the complete request details so we can compare with the
+	// Python client. This is essential for diagnosing why the server
+	// returns metadata-only frames.
+	log.Printf("[RequestDebug] POST %s", req.URL.String())
+	log.Printf("[RequestDebug] Model: %s", model)
+	log.Printf("[RequestDebug] Headers:")
+	for k, vv := range req.Header {
+		for _, v := range vv {
+			if len(v) > 120 {
+				v = v[:120] + "..."
+			}
+			log.Printf("[RequestDebug]   %s: %s", k, v)
+		}
+	}
+	// Log the f.req form value (first 500 chars) for format comparison.
+	if len(data) > 200 {
+		log.Printf("[RequestDebug] Body (first 500): %s", data[:minInt(500, len(data))])
+	} else {
+		log.Printf("[RequestDebug] Body: %s", data)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -406,4 +429,11 @@ func IsSessionError(err error) bool {
 // generateUUID returns a new random UUID string (equivalent to Python's uuid.uuid4()).
 func generateUUID() string {
 	return uuid.New().String()
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
