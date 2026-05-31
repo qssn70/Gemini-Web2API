@@ -336,15 +336,25 @@ func handleSocks5Conn(client net.Conn, tnet *netstack.Net) {
 			return
 		}
 		domain := string(buf[:dLen])
-		// Resolve DNS on the host side — the tunnel's netstack has no
-		// DNS resolver of its own, so passing a raw hostname to
-		// tnet.DialContext would just time out.
+		// Resolve DNS on the host side. The tunnel's netstack has no
+		// DNS resolver, so raw hostnames would time out. Prefer IPv4
+		// because the tunnel only has an IPv4 address (172.16.0.2),
+		// so IPv6 targets return "no route to host".
 		ips, err := net.LookupHost(domain)
 		if err != nil || len(ips) == 0 {
 			client.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
-		host = ips[0]
+		host = ""
+		for _, ip := range ips {
+			if net.ParseIP(ip).To4() != nil {
+				host = ip
+				break
+			}
+		}
+		if host == "" {
+			host = ips[0] // fallback
+		}
 	case 0x04: // IPv6
 		if _, err := client.Read(buf[:16]); err != nil {
 			return
