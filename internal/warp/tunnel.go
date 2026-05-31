@@ -287,7 +287,10 @@ func (t *Tunnel) serveSocks5(tnet *netstack.Net) {
 	for {
 		conn, err := t.ln.Accept()
 		if err != nil {
-			if runningTunnel == nil { // shutting down
+			// Use of closed network connection is expected during
+			// shutdown — suppress the log spam that would otherwise
+			// flood the terminal with hundreds of identical lines.
+			if isClosedConnError(err) {
 				return
 			}
 			log.Printf("[WARP/SOCKS5] accept error: %v", err)
@@ -295,6 +298,17 @@ func (t *Tunnel) serveSocks5(tnet *netstack.Net) {
 		}
 		go handleSocks5Conn(conn, tnet)
 	}
+}
+
+// isClosedConnError returns true when the error is the standard "use of
+// closed network connection" that fires when the listener is shut down.
+func isClosedConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "closed") && strings.Contains(msg, "network")
 }
 
 func handleSocks5Conn(client net.Conn, tnet *netstack.Net) {
